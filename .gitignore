@@ -94,3 +94,27 @@ Thumbs.db
 .railway/
 .vercel/
 .netlify/
+
+# Cloud credentials and local deployment inputs
+.aws/
+.docker/
+**/credentials.json
+deploy/.env
+deploy/.env.*
+!deploy/.env.example
+deploy/*.env
+!deploy/*.env.example
+infra/*.parameters.local.json
+infra/*.parameters.local.yaml
+
+# Generated infrastructure, release archives, and local verification output
+.aws-sam/
+cdk.out/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+deploy/artifacts/
+deploy/releases/
+pilot-smoke-report*.json
+container-smoke-report*.json

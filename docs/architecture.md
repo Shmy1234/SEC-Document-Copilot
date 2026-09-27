@@ -6,6 +6,8 @@ Document Copilot is an internal research assistant for analysts who need grounde
 
 This document describes the target architecture for the chat experience, LLM orchestration, and the communication layer between the React SPA, Supabase, and FastAPI backend.
 
+Hosting decision, 2026-09-27: the proposed Lightsail + Cloudflare target below replaces Railway and the earlier ECS proposal because the user specified a $10/month AWS + Cloudflare ceiling. Infrastructure and deployment have not been implemented or verified in this planning pass. The single implementation checklist remains [todos.md](todos.md#phase-9--devops--deployment-aws--cloudflare); [progress-tracker.md](progress-tracker.md) records current evidence and open decisions.
+
 ## High-Level Architecture
 
 The best opening diagram is a service-level view that shows the two core paths: the live chat path that serves users, and the ingestion path that prepares SEC filings for retrieval.
@@ -14,9 +16,9 @@ The best opening diagram is a service-level view that shows the two core paths: 
 flowchart LR
     user[Analyst] --> browser[Browser<br/>React chat app]
 
-    subgraph railway[Railway]
-        frontend[Frontend service<br/>Vite build]
-        backend[Backend service<br/>FastAPI + PydanticAI]
+    subgraph aws[AWS hosting target - planned]
+        frontend[Caddy static hosting<br/>Vite build]
+        backend[Docker Compose on Lightsail<br/>FastAPI + PydanticAI]
     end
 
     subgraph supabase[Supabase]
@@ -49,7 +51,7 @@ flowchart LR
 - Use Supabase for identity and durable product state: users, chat threads, source documents, chunks, embeddings, and citation metadata.
 - Use Supabase `pgvector` for semantic retrieval and Postgres full-text search for keyword retrieval.
 - Make the LLM path typed and testable by using PydanticAI agents with explicit dependencies, outputs, and tool boundaries.
-- Preserve a simple deployment model on Railway: one frontend service, one stateless backend service, and hosted Supabase.
+- Serve the static frontend and proxy FastAPI through Caddy on one Docker Compose Lightsail host, retaining Supabase and OpenAI. Cloudflare owns DNS initially. Accept a single point of failure within the pilot budget.
 
 ## Stack
 
@@ -369,12 +371,60 @@ Do not read environment variables directly from components, route handlers, or s
 
 ## Deployment Shape
 
-Railway should run two services:
+Status: proposed, not provisioned or verified. The backend Docker recipe has been added, with image/runtime verification pending. The GitHub Actions CI workflow is written, with remote verification pending. Infrastructure templates and deployment automation are not implemented. No AWS, Cloudflare, or GitHub account state was inspected.
 
-- Frontend: static Vite build served as a web app.
-- Backend: FastAPI service running Uvicorn.
+### Budget and scope
 
-Supabase remains hosted and stores the durable retrieval data. The Railway backend can stay stateless because document chunks, embeddings, full-text search vectors, chats, and citations all live in Supabase Postgres. Raw downloaded filings remain gitignored local ingestion inputs unless a later workflow stores them in object storage.
+The user specified **$10/month for AWS + Cloudflare**, excluding Supabase and OpenAI. Currency is still unconfirmed: all vendor amounts below are **USD**, before tax. Confirm currency, tax, region, and whether an existing domain is available before spending. Domain registration/renewal is additional unless included explicitly in the final budget. Do not rely on temporary credits or trials.
+
+The candidate is Lightsail's **$7/month Linux public-IPv4 bundle with 1 GB RAM**, leaving at most $3 before tax for extras. It is a sizing experiment, not proof that this app fits. Build images on CI, never on this small host. Measure cold startup, memory, disk, and one real chat before accepting the instance size. If it runs out of memory, reduce scope or revisit the budget; do not silently resize. [AWS bundle table](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-bundles.html)
+
+Cloudflare DNS is available free. Keep a static Lightsail IP attached; audit unused resources. Snapshot storage, excess transfer, additional instances, logs, CI artifact overages, taxes, and domains can break the ceiling. Estimate and review these explicitly. Budget alerts do not enforce a hard cap. [Cloudflare DNS](https://developers.cloudflare.com/dns/faq/), [Lightsail pricing](https://aws.amazon.com/lightsail/pricing/)
+
+### Service boundaries
+
+| Responsibility | Proposed owner |
+| --- | --- |
+| Hosting | One Lightsail Linux instance, 1 GB candidate, region chosen for users and Supabase connectivity |
+| Frontend and HTTPS | Caddy container serving the compiled Vite assets and automatically obtaining/renewing public certificates |
+| API | FastAPI container on a private Compose network; one worker initially |
+| DNS | Cloudflare Free; DNS-only A records for app/api pointing to the attached static IP |
+| Infrastructure | CloudFormation for Lightsail instance, static IP, and declared networking; reviewed bootstrap script for OS/Docker |
+| CI/CD | GitHub Actions, immutable release artifacts, protected production deployment |
+| Secrets | Restricted server-side configuration file provisioned separately over authenticated SSH; no secrets in bootstrap user data |
+| Durable data/auth | Existing hosted Supabase, with backup coverage verified separately |
+| AI | Existing OpenAI integration, with explicit workload/spend controls |
+| Monitoring | Lightsail metrics, rotated container logs, bounded health monitoring and billing alerts |
+
+Caddy is a standard web server used for TLS renewal, static file serving, and reverse proxying; it is infrastructure software, not a new application framework. Store its certificate data persistently and patch its pinned image. Expose only 80/443 publicly; HTTP redirects to HTTPS. Do not publish backend port 8000, the Docker socket, or the Caddy administration endpoint. [Caddy automatic HTTPS](https://caddyserver.com/docs/automatic-https)
+
+DNS is a lookup step, not an HTTP hop when records are DNS-only. Requests follow browser → Lightsail/Caddy → static files or FastAPI. Browser authentication also contacts Supabase. The backend contacts Supabase and OpenAI. Cloudflare DNS-only provides no Cloudflare HTTP WAF, caching, or HTTP DDoS filtering. [Proxy status](https://developers.cloudflare.com/dns/proxy-status/)
+
+Use `app.example.com` for the SPA and `api.example.com` for FastAPI. Preserve existing email records during DNS migration and verify DNSSEC delegation when changing providers. Supply Vite variables at build time; update backend CORS and Supabase site/redirect URLs together. Preserve SPA navigation fallback without turning missing assets into HTML responses. Hashed assets may be cached; `index.html` must revalidate.
+
+### Release design
+
+Build the backend image and frontend assets from the same checked commit on GitHub-hosted runners. Keep current and previous release identifiers, checksums, and artifacts within verified GitHub storage/minute allowances. Initially transfer a compressed Docker image archive and frontend archive over SSH; a paid registry is unnecessary. Do not make private images public to obtain free storage.
+
+CloudFormation owns host infrastructure; the application workflow owns versioned application files and Compose releases. Keep host replacement out of normal application deployment. Review replacement/deletion in infrastructure change sets and preserve a recovery path for secrets, certificates, and host configuration. [CloudFormation Lightsail resources](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/AWS_Lightsail.html)
+
+Use GitHub OIDC for short-lived AWS deployment credentials. A bounded implementation experiment should use Lightsail's temporary SSH access API, verify the server host key against a trusted bootstrap record, and allow the runner's SSH source IP only for the deployment window. Treat that temporary firewall rule as an explicit exception to the declared baseline; revoke it even after failure and verify cleanup. Never log the temporary private key. If this path cannot be constrained and verified, keep releases operator-driven until the access design is resolved. [GitHub OIDC](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-aws), [Lightsail temporary access](https://docs.aws.amazon.com/cli/latest/reference/lightsail/get-instance-access-details.html)
+
+Deployment access can replace executable application code and may imply host administration. Restrict it to trusted production workflows; pull requests must never obtain it. Do not assume a normal Lightsail host has an EC2 instance profile or put permanent AWS keys on the server to simplify deployment.
+
+Deployments have a maintenance window at this budget. Bound and drain current turns, stop the old API to free memory, run an additive Alembic migration once from the release image, then start the new API and switch compatible frontend assets. Verify health and a bounded smoke check. On failure, restore the previous application artifacts only if the database schema remains compatible. An application rollback does not undo schema/data changes. Keep destructive migrations separate.
+
+Run migrations over a verified direct/session Supabase endpoint, never the transaction pooler. Test DNS/IP-family reachability from the host. Ingestion remains a separate bounded operation on a capable trusted machine; do not run corpus conversion/embedding builds alongside the API on a 1 GB host.
+
+### Limits and later decisions
+
+Existing `/health` reports liveness, not successful retrieval or model access. Chat tasks are process-local even after browser disconnect, so restarts can interrupt them. Verify stream delivery, quiet intervals, bounded turn duration, client retry behavior, and graceful shutdown. Avoid promising zero downtime, durable background execution, or capacity for 40 concurrent users.
+
+Security work must verify API ownership checks because service-role calls can bypass database RLS. Apply per-user quotas, concurrent-turn limits, bounded inputs, timeouts, model/tool budgets, and deletion/retention rules before expanding beyond invited test users. Cloudflare filtering cannot replace application authorization or spending limits.
+
+Optional later step: proxy selected HTTP hostnames through Cloudflare Free after verifying feature availability. Use Full (strict) TLS, bypass all authenticated API caching, test streaming and authentication, and prevent direct-origin bypass with suitable network/origin controls. Account for certificate renewal when restricting ingress. Cloudflare would then terminate TLS and process API traffic; include it in the data-flow review. [TLS guidance](https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/full-strict/), [timeout guidance](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-524/)
+
+Deferred until budget or measured requirements change: ECS/Fargate, ALB, NAT gateways, S3/CloudFront frontend hosting, ECR, paid WAF, managed secrets/logging additions, a permanent staging server, and multi-zone availability. Do not add RDS, Cognito, another vector store, Kubernetes, Redis, or queues speculatively. The AWS application stack stays Python/React/Supabase/OpenAI.
 
 ## Implementation Sequence
 

@@ -157,7 +157,7 @@ flowchart TB
 | Retrieval | `pgvector`, Postgres full-text search, Reciprocal Rank Fusion |
 | AI | OpenAI SDK, OpenAI embeddings, PydanticAI target orchestration |
 | Package management | `uv` for backend, `pnpm` for frontend |
-| Hosting target | Railway frontend service + Railway backend service + hosted Supabase |
+| Hosting target (planned) | AWS Lightsail + Docker Compose/Caddy + Cloudflare DNS; hosted Supabase |
 
 ## Repository Layout
 
@@ -421,80 +421,9 @@ pnpm build
 
 ## Deployment
 
-The intended production deployment is:
+The planned deployment is one AWS Lightsail Linux instance running Docker Compose, with Caddy serving the Vite build and proxying FastAPI, and Cloudflare Free providing DNS. Supabase and OpenAI remain external services. This replaces the earlier Railway and ECS proposals because the hosting budget is $10/month, excluding Supabase/OpenAI; currency and taxes still need confirmation.
 
-- Railway service for `backend/`
-- Railway service for `frontend/`
-- Hosted Supabase project for Auth and Postgres
-- OpenAI API for embeddings and LLM calls
-
-### 1. Prepare Supabase
-
-1. Create a Supabase project.
-2. Enable email auth.
-3. Copy the project URL, anon key, and service role key.
-4. Copy the direct Postgres connection string from project settings.
-5. Run migrations from a trusted environment:
-
-```bash
-cd backend
-uv run alembic upgrade head
-```
-
-### 2. Deploy Backend On Railway
-
-Create a Railway service rooted at `backend/`.
-
-Set these environment variables:
-
-```text
-SUPABASE_URL=
-SUPABASE_ANON_KEY=
-SUPABASE_SERVICE_ROLE_KEY=
-DATABASE_URL=
-OPENAI_API_KEY=
-OPENAI_CHAT_MODEL=openai:gpt-5-mini
-OPENAI_EMBEDDING_MODEL=text-embedding-3-small
-OPENAI_EMBEDDING_DIMENSIONS=1536
-ALLOWED_ORIGINS=https://your-frontend-domain
-```
-
-Use a production server command equivalent to:
-
-```bash
-uv run uvicorn app.main:app --host 0.0.0.0 --port $PORT
-```
-
-### 3. Deploy Frontend On Railway
-
-Create a Railway service rooted at `frontend/`.
-
-Set these environment variables:
-
-```text
-VITE_API_BASE_URL=https://your-backend-domain
-VITE_SUPABASE_URL=
-VITE_SUPABASE_ANON_KEY=
-```
-
-Build command:
-
-```bash
-pnpm install --frozen-lockfile && pnpm build
-```
-
-Serve the generated `dist/` directory with Railway's static hosting support or a small static file server configured by the deployment platform.
-
-### 4. Ingest Documents
-
-After the database schema is live, run ingestion from a secure environment that has backend secrets:
-
-```bash
-cd backend
-uv run document-copilot-ingest --upload --yes
-```
-
-Do not run ingestion from the browser or expose ingestion credentials to the frontend.
+The backend Docker recipe is available with [local build/run instructions](docs/guides/backend-docker.md); its runtime verification is pending. A [GitHub Actions CI workflow](docs/guides/ci.md) has been added; its remote checks are pending. AWS infrastructure and CD automation are not implemented yet. Follow the existing [Phase 9 checklist](docs/todos.md#phase-9--devops--deployment-aws--cloudflare), [architecture and budget decisions](docs/architecture.md#deployment-shape), and [current progress](docs/progress-tracker.md). The $7 USD/month 1 GB Lightsail candidate must pass memory and workload checks before acceptance; this plan does not promise high availability or zero-downtime releases.
 
 ## Security Notes
 
@@ -512,4 +441,4 @@ Do not run ingestion from the browser or expose ingestion credentials to the fro
 - Replace the streaming stub with grounded assistant orchestration.
 - Add citation validation before assistant messages are persisted.
 - Add retrieval and grounding evaluation fixtures.
-- Add deployment configuration files once Railway services are finalized.
+- Implement the budgeted Lightsail, Cloudflare, Docker, and CI/CD milestones in `docs/todos.md`, Phase 9.

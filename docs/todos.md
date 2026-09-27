@@ -171,95 +171,143 @@ Goal: 5 senior analysts can use it for a week and report ≥3 hours saved per an
 - [x] Basic structured logging on backend (`structlog`) for debugging failed turns
 - [x] Review latency: streaming starts within a few seconds for typical queries
 
-## Phase 9 — DevOps & deployment (AWS + Docker + GitHub Actions)
+## Phase 9 — DevOps & deployment (AWS + Cloudflare)
 
-Goal: deploy the production app through a repeatable, observable pipeline while learning the AWS building blocks behind container hosting, networking, load balancing, health checks, and rollback.
+Status: **planned, not implemented**. Updated 2026-09-27 after the user set a $10/month AWS + Cloudflare ceiling, excluding Supabase and OpenAI. Currency remains unconfirmed; vendor estimates are USD before tax. This replaces the earlier ECS/ALB/NAT proposal. Architecture and tradeoffs belong in [architecture.md](architecture.md#deployment-shape); current evidence belongs in [progress-tracker.md](progress-tracker.md).
 
-Target architecture: Route 53 → CloudFront + S3 (React SPA) and Application Load Balancer → ECS Fargate (Dockerized FastAPI) → Supabase + OpenAI.
+This file remains the single project checklist. New deployment tasks use `[]` not started, `[*]` in progress, and `[x]` verified complete. Historical phase statuses above are preserved, not revalidated. Each work package below is split into small execution milestones when selected; it is not a promise to complete an entire package in five minutes.
 
-### 9.1 — AWS account, access, and infrastructure as code
+Target: Cloudflare DNS → one Lightsail Linux host → Caddy + Docker Compose → FastAPI; Caddy also serves the Vite build. Retain Supabase and OpenAI. Accept a single point of failure and brief deployment downtime for an invite-only pilot.
 
-- [ ] Enable MFA on the AWS root account; create an administrative IAM identity for setup work and stop using root
-- [ ] Create an AWS Budget with email alerts and enable billing/free-tier usage notifications
-- [ ] Choose one AWS region and document it as the deployment region
-- [ ] Define the deployment infrastructure in AWS CloudFormation so it can be reviewed, recreated, and updated without console-only steps
-- [ ] Store production secrets in AWS Secrets Manager and non-secret configuration in Systems Manager Parameter Store
-- [ ] Create separate ECS task execution and application task IAM roles with least-privilege policies
+### 9.0 — Decisions before paid infrastructure
 
-### 9.2 — Docker images
+Outcome: a costed pilot scope with known tradeoffs. Boundary: planning only.
 
-- [ ] Add a production backend `Dockerfile`: pinned Python base image, dependency layer caching, non-root runtime user, Uvicorn command, and `.dockerignore`
-- [ ] Add a Docker health check that calls the FastAPI health endpoint without depending on Supabase or OpenAI availability
-- [ ] Build and run the backend image locally; verify health, CORS, authentication, streaming, and graceful shutdown
-- [ ] Create a private Amazon ECR repository with immutable tags, vulnerability scanning, and a lifecycle rule for old images
-- [ ] Tag backend images with the Git commit SHA instead of deploying mutable `latest` tags
+- [] Confirm whether the $10 ceiling is USD or CAD, and whether tax and domain renewal must fit it.
+- [] Confirm domain ownership, audience, relevant regions/data requirements, and AWS/Supabase locations.
+- [] Price the $7 USD/month public-IPv4, 1 GB Linux Lightsail candidate in the chosen region. Include transfer, snapshots, temporary test instance hours, artifact retention, and taxes. Do not rely on trial credits.
+- [] Confirm GitHub Actions minutes/storage allowance and Supabase backup plan separately; keep model costs outside this hosting estimate but bounded.
+- [] Agree pilot downtime, maximum simultaneous chats, acceptable data loss, and recovery time. Define initial targets before verification, not after observing results.
 
-### 9.3 — VPC and network security
+Acceptance: documented estimate fits the confirmed ceiling, with explicit exclusions and an agreed response if the smallest suitable instance does not fit.
 
-- [ ] Create a VPC spanning two Availability Zones
-- [ ] Create public subnets for the Application Load Balancer and NAT gateways
-- [ ] Create private subnets for ECS tasks; route outbound Supabase, OpenAI, ECR, and CloudWatch traffic through the NAT gateways
-- [ ] Create an ALB security group allowing public HTTP/HTTPS traffic
-- [ ] Create an ECS security group allowing backend traffic only from the ALB security group
-- [ ] Confirm the database remains in Supabase; do not add RDS or expose ECS task ports directly to the internet
+### 9.1 — Next milestone: local backend container
 
-### 9.4 — Backend on ECS Fargate
+Outcome: reproducible startup without installing development tooling into production. Boundary: local files and checks only; no account writes, migrations, or paid API calls.
 
-- [ ] Create an ECS cluster, Fargate task definition, and service using the ECR image
-- [ ] Inject secrets and configuration into the task definition; set production `ALLOWED_ORIGINS` explicitly
-- [ ] Send container logs to a CloudWatch Logs group with a retention policy
-- [ ] Create an Application Load Balancer, HTTPS listener, target group, and HTTP-to-HTTPS redirect
-- [ ] Configure the target group to health-check the FastAPI health endpoint with an appropriate startup grace period
-- [ ] Run two ECS tasks across Availability Zones and enable rolling deployments
-- [ ] Enable the ECS deployment circuit breaker with automatic rollback when tasks fail to start or become healthy
-- [ ] Configure ECS Service Auto Scaling with conservative minimum/maximum task counts and CPU/memory targets
-- [ ] Verify the ALB routes only to healthy tasks and the API stream remains open for a complete assistant response
+2026-09-27 implementation status: Docker recipe, build-context exclusions, synthetic configuration, and [local run guide](guides/backend-docker.md) added. Runtime dependency export and static checks pass. Container verification is blocked because the local Docker engine does not respond; this milestone is not complete.
 
-### 9.5 — Frontend on S3 and CloudFront
+- [*] Add `backend/Dockerfile` with a pinned supported Python base, locked production dependencies using uv, a non-root runtime user, and one Uvicorn worker on `0.0.0.0:8000` without reload. Recipe written; image build pending.
+- [*] Add `backend/.dockerignore` excluding `.env`, caches, virtual environments, Git data, tests where unnecessary, and corpus payloads. Include required prompt files, ingestion package, and Alembic files in the image deliberately. Allowlist written; image-content inspection pending.
+- [] Build for the eventual host CPU architecture; do not assume an Apple Silicon local build runs on an x86 host.
+- [] Run locally with synthetic required settings and verify `/health` returns 200. Inspect image configuration/layers for accidental secrets; do not print real values.
+- [] Verify removing `OPENAI_FAST_MODEL` causes startup failure. Record cold-start memory with the candidate memory limit and stop if it exceeds the budgeted host capacity.
 
-- [ ] Create a private S3 bucket for the Vite production build; block all public bucket access
-- [ ] Create a CloudFront distribution with Origin Access Control so only CloudFront can read the bucket
-- [ ] Configure SPA fallback routing so React Router paths return `index.html`
-- [ ] Configure production `VITE_API_BASE_URL`, `VITE_SUPABASE_URL`, and `VITE_SUPABASE_ANON_KEY` at build time
-- [ ] Set long-lived immutable caching for hashed assets and no-cache behavior for `index.html`
-- [ ] Verify direct navigation and refresh work on login, chat-list, and chat-thread routes
+Acceptance: a fresh build starts with synthetic configuration, returns health, fails on missing required configuration, and contains no supplied secret files. This does not verify Supabase/OpenAI connectivity or production capacity.
 
-### 9.6 — DNS and TLS
+### 9.2 — Pull-request checks and repository hygiene
 
-- [ ] Manage the application domain in Route 53 or delegate the required DNS records to Route 53
-- [ ] Issue AWS Certificate Manager certificates for the frontend and API domains
-- [ ] Attach the certificates to CloudFront and the ALB; expose only HTTPS publicly
-- [ ] Create Route 53 alias records for the CloudFront distribution and ALB
-- [ ] Update Supabase Auth redirect URLs and backend CORS origins to the final production domains
+2026-09-27 status: [CI workflow](guides/ci.md), isolated container smoke script, and deployment ignore rules added. Shell syntax and ignore-rule checks pass. First GitHub run, branch protection, full dependency/security scanning, and deployment automation remain unverified or unimplemented.
 
-### 9.7 — GitHub Actions CI/CD
+Outcome: unsafe or broken changes fail before deployment. Boundary: repository and CI configuration; enable remote settings only with authorized account access.
 
-- [ ] Create a GitHub Actions OIDC identity provider and least-privilege deployment role in AWS; do not store long-lived AWS access keys in GitHub
-- [ ] Add a pull-request workflow that runs backend tests, frontend tests/type-checking, the frontend build, and a backend Docker build
-- [ ] Add a production backend workflow: authenticate through OIDC, build the image, push the commit-SHA tag to ECR, register a task-definition revision, and update the ECS service
-- [ ] Make the backend workflow wait for ECS stability and fail when the deployment circuit breaker rolls back
-- [ ] Add a production frontend workflow: build the SPA, sync assets to S3 without deleting unrelated objects, and invalidate the required CloudFront paths
-- [ ] Protect the production GitHub environment, restrict deployments to the production branch, and require workflow approval if the repository supports it
-- [ ] Prevent concurrent production deployments from racing by using a GitHub Actions concurrency group
+- [] Pin supported Python, Node, uv, and pnpm versions; honor existing release-age policies and lockfiles. Check Vite's actual Node requirement rather than relying on an old README minimum.
+- [*] Add `ci.yml`: `uv sync --frozen`, `uv run ruff check .`, `uv run pytest -m "not integration"`, `pnpm install --frozen-lockfile`, `pnpm lint`, `pnpm build`, and a backend image build.
+- [] Keep PR jobs free of production credentials and paid/live tests. Pin third-party Actions to reviewed full commit SHAs, use minimal token permissions, and set job timeouts.
+- [] Require the checks on the main branch, review changes to workflows/infrastructure, and use small PRs with acceptance evidence. Keep required check reporting reliable for path-filtered jobs.
+- [] Add suitable secret/dependency/image scanning within available free tooling; triage findings with an owner and fix/exception decision rather than equating a clean scan with security.
+- [] Repair the live schema test's stale `0003` expectation against the actual migration head and verify RLS/functions as well as revision. Treat corpus-count assertions as fixture-specific.
 
-### 9.8 — Observability and operational checks
+Acceptance: a deliberately failing unit/lint/build check blocks merging; clean PR checks need no live credentials. No frontend test runner is introduced, per `frontend/AGENTS.md`.
 
-- [ ] Create a CloudWatch dashboard for ALB request count/latency/4xx/5xx, unhealthy targets, and ECS CPU/memory/running-task count
-- [ ] Create CloudWatch alarms for ALB 5xx responses, unhealthy targets, no running ECS tasks, deployment failure, and sustained CPU/memory pressure
-- [ ] Send alarm and failed-deployment notifications through SNS email
-- [ ] Verify container logs contain request/deployment context without tokens, secrets, or filing contents that should remain private
-- [ ] Test failure handling: deploy an unhealthy image, confirm traffic stays on healthy tasks or rolls back, and then restore the valid revision
-- [ ] Document rollback, log inspection, ECS task restart, secret rotation, and CloudFront cache invalidation commands in the deployment runbook
+### 9.3 — Account security and Lightsail infrastructure
 
-### 9.9 — Production release
+Outcome: one reproducible, budgeted host. Boundary: approved pilot resources only.
 
-- [ ] Supabase: re-enable email confirmation for production if disabled during development
-- [ ] Run `alembic upgrade head` against production Supabase using the direct connection before deploying application code that depends on the migration
-- [ ] Run ingestion against the production database and verify document/chunk counts
-- [ ] Deploy the backend and frontend exclusively through GitHub Actions
-- [ ] Run smoke tests against the public health endpoint, authentication flow, chat history, streaming response, and citation source panel
-- [ ] End-to-end test on the deployed URLs with a real Equity Research Assistant-style email account
-- [ ] Review AWS Cost Explorer, Budget status, CloudWatch alarms, and GitHub Actions deployment history after the first 24 hours
+- [] Enable root MFA and recovery methods; use a non-root administrative identity with temporary sessions for setup. Protect Cloudflare and GitHub accounts with MFA too.
+- [] Configure budget notifications at useful fractions of the confirmed ceiling and review projected costs. Alerts are not a hard spending limit.
+- [] Create a small CloudFormation template for the chosen Lightsail instance, attached static IP, tags, and baseline firewall. Review a change set before creation; avoid automated deletion/replacement of the only live host.
+- [] Add a reviewed, idempotent OS/Docker/Compose bootstrap script with pinned supported sources, security updates, reboot procedure, log rotation, and disk limits. Never embed credentials in user data.
+- [] Permit public HTTP/HTTPS only; restrict SSH to approved source addresses. Keep API/container admin ports private and verify from outside the host.
+- [] Provision production secrets separately into restricted files; verify only the administrator and intended runtime identity can read them. Record recovery and rotation procedures without secret values.
+
+Acceptance: the host can be rebuilt from reviewed definitions; only intended ports are reachable; no unused billable infrastructure remains. Confirm static-IP/snapshot billing rules before cleanup.
+
+### 9.4 — Compose, frontend, Cloudflare, and HTTPS
+
+Outcome: a manually verified HTTPS pilot. Boundary: one host and DNS-only Cloudflare records.
+
+- [] Add `deploy/compose.yaml` and `deploy/Caddyfile`; Caddy serves versioned frontend assets and proxies the API over a private container network. Persist Caddy certificate state and set restart/log policies.
+- [] Build the frontend off-host with browser-safe `VITE_` settings. Include `OPENAI_FAST_MODEL` and all other required settings in the deployment configuration inventory; never place backend secrets in Vite variables.
+- [] Add the domain to Cloudflare Free, preserve mail/TXT records, verify DNSSEC handling, and change nameservers only after checking the complete record set.
+- [] Create DNS-only `app` and `api` A records for the static IP. Obtain Caddy public certificates and verify renewal/storage; configure Supabase site/redirect URLs and exact backend CORS origins.
+- [] Configure SPA fallback for navigations, correct missing-asset errors, revalidated HTML, long-lived hashed assets, and bounded old-asset retention for rollback/open browser sessions.
+- [] Apply migrations once against a non-production/synthetic environment first. Verify direct/session database connectivity from the host. Run a bounded live chat only with authorized credentials/spend.
+
+Acceptance: valid HTTPS, HTTP redirect, direct chat-page refresh, sign-in, streamed answer, citation opening, and history reload all work. Record peak memory/CPU/disk; a 1 GB host is accepted only on evidence.
+
+### 9.5 — Reproducible releases and rollback
+
+Outcome: release a tested commit with a known recovery path. Boundary: one protected pilot environment; no zero-downtime promise.
+
+- [] Add separate infrastructure and application workflows. CloudFormation owns host resources; application deploys must not replace the host.
+- [] Configure GitHub OIDC restricted to this repository and production environment. Prototype Lightsail temporary SSH access, trusted host-key verification, and a runner-IP-only temporary SSH firewall rule with guaranteed cleanup verification.
+- [] Build once on CI; record commit, backend image identity/checksum, frontend archive, migration revision, and configuration version. Transfer artifacts securely; retain current/previous releases within storage quotas. Do not expose private images publicly.
+- [] Serialize deployments with a remote lock as well as GitHub concurrency; never cancel halfway through migration without a recovery decision. Use environment approval if supported by the repository plan.
+- [] Enter maintenance/drain mode, bound in-flight work, stop the old API if needed for memory, run the release migration once, then start the new API and publish compatible frontend assets.
+- [] Verify the actual release identifier plus health/auth/stream checks. On failure, restore the previous image/frontend when schema-compatible; report deployment failure even if rollback succeeds. Test this with a deliberately unhealthy release in a safe environment.
+
+Acceptance: a checked commit is traceable to the running release; failed deployment is visible; rollback restores a working application; temporary access is revoked after success and failure. If safe CI access cannot be verified, keep deployment manual until resolved.
+
+### 9.6 — Application security and AI cost controls
+
+Outcome: invited users can access only their own data within bounded work. Boundary: targeted backend changes, each selected as a small milestone.
+
+- [] Verify authentication and account-B-versus-account-A isolation across thread list/read/update/delete, streaming, citations, and tool paths. Service-role database calls require explicit backend ownership checks even when RLS exists.
+- [] Set input/history limits, request deadlines, outbound timeouts/retries, per-user quotas, and concurrent-turn limits. Existing agent request/tool limits do not cap total user spending. Enforce shared quotas across processes using the current database where practical.
+- [] Verify retries/disconnects cannot accidentally duplicate paid turns; document whether a disconnected turn continues, fails, or can be resumed. Add request identifiers/idempotency only for the defined behavior.
+- [] Treat filings/model output as untrusted; preserve citation validation and bounded tool access. Keep ingestion private and separately authorized.
+- [] Review CSP and other browser headers, CORS, error responses, and log redaction against the actual frontend/auth integrations. Start restrictive headers in a verifiable rollout rather than breaking sign-in blindly.
+- [] Before real-user onboarding, settle data categories, audience/regions, retention/deletion, provider handling, and appropriate notices. Validate implemented deletion and backup retention; do not infer legal compliance from these checks.
+
+Acceptance: unauthorized access is denied before data/model work, quota exhaustion stops new work predictably, and errors/logs contain no credentials or unnecessary private chat content.
+
+### 9.7 — Monitoring, backup, and recovery
+
+Outcome: detect failures and recover within agreed pilot targets. Boundary: fit the confirmed hosting budget; do not silently enable paid monitoring.
+
+- [] Distinguish cheap liveness checks from bounded readiness/live smoke checks. Monitor external HTTPS, Lightsail resource metrics, memory/disk locally, certificate expiry, container restarts, and billing.
+- [] Rotate/cap structured logs. Record request IDs, release IDs, timings, typed failures, and aggregate model usage; avoid raw tokens, prompts, and private passages. Identify one person responsible for alerts.
+- [] Verify the actual Supabase plan's backup coverage and retention. If using exports, encrypt them off-host, restrict access, budget storage, and check coverage of roles/auth/schema/data and any storage objects separately.
+- [] Reconstruct a test database from a backup and verify chats, ownership policies, citations, vector dimensions, and migration state. Measure recovery time/data loss against agreed targets.
+- [] Create a short runbook for host rebuild, restore, application rollback, leaked-key rotation, certificate/DNS failure, disk exhaustion, interrupted migration, and model/Supabase outage. Keep checklist ownership here; the runbook contains procedures/evidence.
+
+Acceptance: a real restore/rebuild exercise works, alerts reach the responsible person, and logs/disk/backups have bounded growth. Supabase plan-specific backup behavior must be checked: [official guidance](https://supabase.com/docs/guides/platform/backups).
+
+### 9.8 — Pilot release gate
+
+Outcome: an evidence-backed invite-only release. Boundary: the agreed pilot load; no public-scale claims.
+
+- [] Complete [pilot-readiness.md](guides/pilot-readiness.md), including the ten-question grounding review and account isolation.
+- [] Verify keyboard navigation, focus, narrow screens, loading/error states, and citation accessibility manually, consistent with the frontend testing policy.
+- [] Test the agreed concurrent workload with synthetic data and capped model calls; record memory, response timing, failure rate, and provider/database limits. Separate mock throughput results from live end-to-end evidence.
+- [] Verify sign-up policy/email confirmation, SMTP delivery/configuration if needed, data notices, secrets, recovery evidence, known downtime, and monthly cost estimate before invitations.
+- [] Record release identifiers, checks, unresolved risks, owner, and rollback procedure. Review actual spend and failures after the first day and week.
+
+Acceptance: all required release checks have evidence or an explicitly accepted scope reduction; no silent upgrade to a larger AWS plan.
+
+### 9.9 — Maintenance and optional growth
+
+Outcome: keep a small system operable without adding unnecessary services.
+
+- [] Schedule a human-reviewed cadence for dependencies/base images, OS security updates/reboots, vulnerability triage, restore checks, access review, and cost review. Automations require their own authorization.
+- [] Maintain a small retrieval/grounding evaluation set when prompts/models/chunking change; record model/configuration and compare citation quality, latency, and bounded cost.
+- [] If Cloudflare proxying is selected, verify Free-plan capabilities, Full (strict) TLS, API cache bypass, streaming, origin access restrictions, certificate renewal, and the changed data flow before enabling it.
+- [] Revisit ECS/ALB, managed secrets/logs, separate staging, S3/CloudFront, or higher availability only after budget increases or measured requirements justify them.
+
+Acceptance: future work has a measured reason, a cost estimate, and a small observable check.
+
+Provider guidance: [GitHub workflow security](https://docs.github.com/en/actions/reference/security/secure-use), [AWS Lightsail bundles](https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-bundles.html), and the linked sources in [architecture.md](architecture.md#deployment-shape). Verify account-specific pricing/quotas before implementation.
 
 ## Quick reference
 

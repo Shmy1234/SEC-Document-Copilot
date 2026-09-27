@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, 'devops/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend lint and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: '0.12.5'
+          python-version: '3.12.14'
+          enable-cache: false
+      - run: uv sync --frozen
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync pytest -m "not integration"
+
+  frontend:
+    name: Frontend lint and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    env:
+      VITE_API_BASE_URL: https://api.example.invalid
+      VITE_SUPABASE_URL: https://supabase.example.invalid
+      VITE_SUPABASE_ANON_KEY: synthetic-anon
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: '10.17.1'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22.17.1'
+          package-manager-cache: false
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm build
+
+  container:
+    name: Backend container smoke check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build the proposed server architecture
+        run: docker build --platform linux/amd64 -t document-copilot-backend:ci backend
+      - name: Verify isolated startup and required configuration
+        run: bash scripts/check-backend-container.sh document-copilot-backend:ci
