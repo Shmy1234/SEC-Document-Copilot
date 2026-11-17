@@ -1,6 +1,6 @@
 import type { UIMessage } from '@ai-sdk/react'
 import { Check, Copy, SearchX } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { memo, useRef, useState } from 'react'
 
 import { AnswerBody } from '@/components/chat/AnswerBody'
 import { CitationChip } from '@/components/chat/CitationChip'
@@ -15,7 +15,8 @@ type AssistantMessageProps = {
   onCitationSelect: (messageId: string, citation: Citation, chip: HTMLButtonElement | null) => void
 }
 
-export function AssistantMessage({
+/** Memoised: while one answer streams, settled answers skip re-rendering. */
+export const AssistantMessage = memo(function AssistantMessage({
   message,
   streaming,
   selectedCitationIndex,
@@ -98,4 +99,4 @@ export function AssistantMessage({
       ) : null}
     </div>
   )
-}
+})
