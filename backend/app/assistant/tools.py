@@ -112,7 +112,10 @@ async def search_filings(
 
 
 async def read_chunk(deps: DocumentAgentDeps, args: ReadChunkArgs) -> ToolResult:
-    chunk = await deps.retriever.read_chunk(args.chunk_id)
+    try:
+        chunk = await deps.retriever.read_chunk(args.chunk_id)
+    except Exception as error:
+        raise RetrievalError("chunk read failed") from error
     if chunk is None:
         return NO_CHUNK
     candidates = deps.register_chunk_evidence([chunk])
@@ -123,10 +126,13 @@ async def read_surrounding_chunks(
     deps: DocumentAgentDeps,
     args: ReadSurroundingChunksArgs,
 ) -> ToolResult:
-    result = await deps.retriever.read_surrounding_chunks(args.chunk_id, window=args.window)
-    if result is None:
-        return NO_CHUNK
-    center = await deps.retriever.read_chunk(args.chunk_id)
+    try:
+        result = await deps.retriever.read_surrounding_chunks(args.chunk_id, window=args.window)
+        if result is None:
+            return NO_CHUNK
+        center = await deps.retriever.read_chunk(args.chunk_id)
+    except Exception as error:
+        raise RetrievalError("surrounding chunk read failed") from error
     chunks = result["previous_chunks"] + result["next_chunks"]
     if center is not None:
         chunks.insert(0, center)

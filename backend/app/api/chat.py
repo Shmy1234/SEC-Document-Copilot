@@ -202,12 +202,13 @@ async def get_citation_source(
 
 
 def latest_user_text(messages: list[UIMessage]) -> str:
-    for message in reversed(messages):
-        if message.role != "user":
-            continue
-        if message.content and message.content.strip():
-            return message.content
-        part_text = "".join(part.text or "" for part in message.parts if part.type == "text")
+    # Only the newest user message is the question. Falling back to an earlier
+    # one would silently re-ask a previous question when the new one is blank.
+    latest = next((message for message in reversed(messages) if message.role == "user"), None)
+    if latest is not None:
+        if latest.content and latest.content.strip():
+            return latest.content
+        part_text = "".join(part.text or "" for part in latest.parts if part.type == "text")
         if part_text.strip():
             return part_text
     raise HTTPException(

@@ -62,6 +62,9 @@ class ResearchContext:
 
 class ResearchState(TypedDict, total=False):
     messages: Annotated[list[AnyMessage], add_messages]
+    # The latest reply's tool calls, carried explicitly: add_messages merges by
+    # message id, so the history is not a reliable place to find them.
+    pending_calls: list[dict]
     requests: int
     tool_calls: int
     grounding_failures: int
@@ -79,33 +82,45 @@ async def call_model(state: ResearchState, runtime: Runtime[ResearchContext]) ->
         # Tools are forced, so a bare text reply means the provider ignored the
         # contract; there is no structured answer to ground.
         raise ResearchLimitExceeded("model replied without calling a tool")
-    return {"messages": [reply], "requests": requests + 1}
+    return {"messages": [reply], "pending_calls": list(reply.tool_calls), "requests": requests + 1}
 
 
 async def run_tools(state: ResearchState, runtime: Runtime[ResearchContext]) -> ResearchState:
     context = runtime.context
-    # The newest model reply, found by type: add_messages merges messages by id,
-    # so position alone is not a safe way to find it.
-    calls = next(m for m in reversed(state["messages"]) if isinstance(m, AIMessage)).tool_calls
+    calls = state["pending_calls"]
     evidence_calls = [call for call in calls if call["name"] != SUBMIT_ANSWER]
     tool_calls = state.get("tool_calls", 0) + len(evidence_calls)
     if tool_calls > context.limits.tool_calls_limit:
         raise ResearchLimitExceeded("tool call limit reached")
 
     # Evidence tools run first and concurrently so a submit in the same step can
-    # cite what they register.
-    results = await asyncio.gather(*(_evidence_message(context.deps, c) for c in evidence_calls))
-    update: ResearchState = {"messages": list(results), "tool_calls": tool_calls}
+    # cite what they register. A TaskGroup cancels the siblings if one fails.
+    try:
+        async with asyncio.TaskGroup() as group:
+            tasks = [group.create_task(_evidence_message(context.deps, c)) for c in evidence_calls]
+    except ExceptionGroup as failure:
+        # Surface the first tool's own error (e.g. RetrievalError) so the turn
+        # reports a typed failure rather than an opaque group.
+        raise failure.exceptions[0] from None
+    update: ResearchState = {
+        "messages": [task.result() for task in tasks],
+        "tool_calls": tool_calls,
+    }
 
+    failures = state.get("grounding_failures", 0)
     for call in calls:
         if call["name"] != SUBMIT_ANSWER:
             continue
-        outcome = await _submit(context, state.get("grounding_failures", 0), call)
+        if "answer" in update:
+            update["messages"].append(_tool_message(call, "An answer was already accepted."))
+            continue
+        outcome = await _submit(context, failures, call)
         update["messages"].append(outcome.message)
         if outcome.answer is not None:
             update["answer"] = outcome.answer
         else:
-            update["grounding_failures"] = state.get("grounding_failures", 0) + 1
+            failures += 1
+    update["grounding_failures"] = failures
     return update
 
 
@@ -131,9 +146,12 @@ class _SubmitOutcome:
 
 
 async def _submit(context: ResearchContext, failures: int, call: dict) -> _SubmitOutcome:
+    exhausted = failures >= context.limits.grounding_retries
     try:
         draft = AgentAnswer.model_validate(call["args"])
     except ValidationError as error:
+        if exhausted:
+            raise GroundingError("the model did not submit a well-formed answer") from error
         problem = f"Invalid answer: {error.errors(include_url=False)}"
     else:
         await context.deps.on_stage("validating")
@@ -144,9 +162,9 @@ async def _submit(context: ResearchContext, failures: int, call: dict) -> _Submi
                 evidence_candidates=context.deps.evidence_candidates,
             )
         except GroundingError as error:
-            problem = str(error)
-            if failures >= context.limits.grounding_retries:
+            if exhausted:
                 raise
+            problem = str(error)
         else:
             return _SubmitOutcome(_tool_message(call, "Answer accepted."), answer)
     return _SubmitOutcome(

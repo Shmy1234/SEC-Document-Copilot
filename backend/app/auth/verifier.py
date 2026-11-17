@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from time import monotonic
 from uuid import UUID
@@ -43,18 +44,44 @@ class SupabaseTokenVerifier:
         self._max_entries = max_entries
         self._clock = clock
         self._cache: dict[str, tuple[float, AuthenticatedUser]] = {}
+        self._in_flight: dict[str, asyncio.Future[AuthenticatedUser]] = {}
 
     async def verify(self, token: str) -> AuthenticatedUser:
         key = hashlib.sha256(token.encode()).hexdigest()
-        now = self._clock()
         cached = self._cache.get(key)
-        if cached is not None and cached[0] > now:
+        if cached is not None and cached[0] > self._clock():
             return cached[1]
 
-        response = await self._http.get(
-            self._user_url,
-            headers={"apikey": self._anon_key, "Authorization": f"Bearer {token}"},
-        )
+        # A page fires several calls with the same token at once; they share one
+        # upstream check instead of each paying for it.
+        pending = self._in_flight.get(key)
+        if pending is not None:
+            return await asyncio.shield(pending)
+        pending = asyncio.get_running_loop().create_future()
+        self._in_flight[key] = pending
+        try:
+            user = await self._fetch(key, token)
+        except BaseException as error:
+            pending.set_exception(error)
+            # Waiters re-raise it; mark it retrieved so a lone caller does not warn.
+            pending.exception()
+            raise
+        else:
+            pending.set_result(user)
+            return user
+        finally:
+            del self._in_flight[key]
+
+    async def _fetch(self, key: str, token: str) -> AuthenticatedUser:
+        try:
+            response = await self._http.get(
+                self._user_url,
+                headers={"apikey": self._anon_key, "Authorization": f"Bearer {token}"},
+            )
+        except httpx.HTTPError:
+            # Fail closed: an unreachable Auth service must not authenticate anyone,
+            # and its error text must not reach the client.
+            raise InvalidTokenError() from None
         if response.status_code != httpx.codes.OK:
             self._cache.pop(key, None)
             raise InvalidTokenError()
@@ -63,6 +90,7 @@ class SupabaseTokenVerifier:
         except (TypeError, ValueError):
             raise InvalidTokenError() from None
 
+        now = self._clock()
         if len(self._cache) >= self._max_entries:
             self._evict(now)
         self._cache[key] = (now + self._cache_seconds, user)

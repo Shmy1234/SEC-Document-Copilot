@@ -76,8 +76,13 @@ def test_tracer_targets_the_configured_langsmith_project():
         }
     )
 
-    tracer = build_tracer(configured)
+    # The real client probes LangSmith in the background; the suite stays offline.
+    with patch("app.resources.LangSmithClient") as client_type:
+        tracer = build_tracer(configured)
 
     assert tracer is not None
     assert tracer.project_name == "copilot-staging"
-    assert tracer.client.api_url == "https://api.smith.langchain.com"
+    client_type.assert_called_once_with(
+        api_key="lsv2-test", api_url="https://api.smith.langchain.com"
+    )
+    assert tracer.client is client_type.return_value
