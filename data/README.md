@@ -7,8 +7,8 @@ Local data artifacts for development live here.
   grouped by the same year folders.
 - `html_to_markdown/` holds the conversion script and tests.
 - Downloaded payloads are gitignored because the corpus can get large.
-- Set a real contact email in `download.py`, then fetch from the repository root with
-  `uv run data/download.py`.
+- Fetch from the repository root with
+  `SEC_USER_AGENT="Document Copilot you@example.com" uv run data/download.py`.
 - Convert downloaded HTML filings from the repository root with
   `uv run --directory backend python ../data/html_to_markdown/convert_html_to_markdown.py --overwrite`.
 - Preview chunking with
