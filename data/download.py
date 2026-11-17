@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from datetime import UTC, datetime
@@ -12,7 +13,8 @@ from urllib import request
 
 
 # Params: edit these, then run `uv run data/download.py`
-USER_AGENT = "Document Copilot your.email@example.com"
+# SEC requires a real contact. Set SEC_USER_AGENT="Document Copilot you@domain" when running.
+USER_AGENT = os.environ.get("SEC_USER_AGENT", "Document Copilot your.email@example.com")
 TICKERS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"]
 FILINGS_PER_COMPANY = 5
 OUTPUT_DIR = Path(__file__).resolve().parent / "downloads"

@@ -1,248 +1,210 @@
 # Document Copilot
 
-Document Copilot is a production-oriented RAG application for asking grounded questions over a curated SEC filing corpus. It combines a React chat workspace, a FastAPI backend, Supabase Auth/Postgres, OpenAI embeddings, and an ingestion pipeline that converts filings into searchable document chunks.
+**An agentic RAG research assistant that answers questions about SEC 10-K filings and cites the exact passage behind every claim.**
 
-The product goal is simple: help analysts get answers from source documents with a clear trail back to the filings used to produce each answer.
+Built end to end: React SPA → FastAPI → LangGraph agent → hybrid pgvector + full-text retrieval on Supabase, with a grounding validator that blocks any answer it cannot trace to the source filing.
 
-## What It Does
+![Document Copilot demo](docs/media/demo.gif)
 
-- Authenticated chat workspace for document research.
-- Persistent user-owned chat threads and message history.
-- SEC filing ingestion from local Markdown into Supabase Postgres.
-- Chunking and OpenAI embedding generation for retrieval-ready document records.
-- Supabase `pgvector` and Postgres full-text architecture for hybrid retrieval.
-- FastAPI service boundary for auth, persistence, retrieval, grounding, and LLM orchestration.
-- React SPA frontend that talks to the backend with a Supabase bearer token.
+<sub>17-second UI walkthrough ([MP4](docs/media/demo.mp4)). The recording uses the real frontend against a local sample-data API, so the answer shown is illustrative rather than live model output.</sub>
 
-> Current implementation note: authentication, chat shell, thread/message persistence, streaming stub responses, migrations, and ingestion are implemented. The production RAG answer path is represented in the architecture and ingestion foundation, with retrieval, grounding validation, and final assistant orchestration intended to sit behind the existing FastAPI chat boundary.
+---
 
-## Use Cases
+## At a glance (for recruiters and hiring managers)
 
-| User | Use case | Example question | System output |
-| --- | --- | --- | --- |
-| Equity analyst | Compare company performance across filings | "How did Nvidia describe data center demand in 2023 vs 2024?" | Grounded synthesis with filing citations |
-| Research associate | Find risk factors quickly | "Which companies mention supply chain risk in recent 10-Ks?" | Ranked source passages and summary |
-| Portfolio team | Prepare meeting briefs | "Summarize Amazon's capital expenditure discussion over the last three years." | Concise briefing with source links |
-| Compliance reviewer | Verify claims against primary documents | "Where does Apple discuss privacy regulation risk?" | Cited excerpts and document metadata |
-| Engineering team | Build and evaluate RAG workflows | "Which chunks were retrieved and why?" | Inspectable retrieval, chunk, and citation records |
+| | |
+| --- | --- |
+| **What it is** | A production-shaped AI product: authenticated chat, streaming answers, clickable citations, evidence viewer, persisted history. |
+| **Problem it solves** | Equity analysts spend about half of every week reading SEC filings before they can do any analysis. Document Copilot returns the answer *and* the passage that proves it. |
+| **Hardest part** | Trust. An LLM that invents a revenue figure is worse than useless in finance, so every answer passes a code-level grounding check before the user sees it. |
+| **Scale of work** | Full stack across 2 services and 3 data stores; 8 planned build phases; ~400 automated backend tests, all offline. |
+| **Skills shown** | LLM engineering (LangChain, LangGraph, LangSmith, tool calling, structured output) · RAG and search (pgvector, Postgres FTS, Reciprocal Rank Fusion) · Python/FastAPI async backends · React 19/TypeScript · PostgreSQL schema design and migrations · performance profiling · test design · AI-assisted engineering workflow |
 
-```mermaid
-quadrantChart
-    title Document Copilot Use Case Fit
-    x-axis Low repeatability --> High repeatability
-    y-axis Low citation need --> High citation need
-    "Ad hoc market chat": [0.25, 0.20]
-    "Document lookup": [0.45, 0.70]
-    "Risk factor review": [0.70, 0.85]
-    "Earnings prep": [0.62, 0.76]
-    "Portfolio research workflows": [0.86, 0.90]
-```
+### What I'd point a reviewer to
 
-## Architecture
+1. **Fail-closed grounding** (`backend/app/grounding/validator.py`): every cited quote must appear verbatim in a passage retrieved during that turn, every number in the answer must appear in the cited evidence, and figures must keep their original order. Otherwise the turn fails with a typed error instead of showing a polished guess.
+2. **A LangGraph agent with a budget** (`backend/app/assistant/agent.py`): a tool-calling research loop that can only finish through a validated `submit_answer` tool, with hard limits on model requests and tool calls.
+3. **Measured performance work**: I found a per-request database connection leak, serial LLM calls, and N+1 queries, fixed them, and wrote benchmarks that prove the fixes ([Performance](#performance-engineering)).
 
-Document Copilot is split into a browser client, a stateless API service, hosted Supabase infrastructure, OpenAI model APIs, and a batch ingestion path.
+---
+
+## Screenshots
+
+| Grounded answer with sources | Evidence viewer |
+| --- | --- |
+| ![Answer with citation chips](docs/media/grounded-answer.png) | ![Cited table with neighbouring passages](docs/media/evidence-panel.png) |
+
+![Landing page](docs/media/landing.png)
+
+---
+
+## Purpose and use cases
+
+The project started from a client brief for an independent equity research firm (~40 analysts, each covering ~15 US public companies). Its value is condensation: turning thousands of pages of filings into a thesis a portfolio manager can act on. The bottleneck is source intake, which means opening 10-Ks, finding the MD&A, risk factors and segment tables, and comparing them year over year.
+
+| Use case | Example question | What the system does |
+| --- | --- | --- |
+| **Metric lookup** | "How did Apple's Services revenue change between fiscal 2023 and 2024?" | Quick RAG: one hybrid search and one model call, answer cited to the net-sales table. |
+| **Longitudinal comparison** | "How did NVIDIA describe Data Center demand from fiscal 2021 to 2025?" | Deep RAG: the agent searches several years, reads neighbouring chunks, and synthesises. |
+| **Cross-company risk review** | "Which companies changed risk-factor language on export controls?" | Deep RAG across tickers, with every claim tied to a passage. |
+| **Verification** | Clicking a citation chip | Opens the exact cited text, highlighted inside its chunk, with the neighbouring passages and a link to the filing on EDGAR. |
+| **Out-of-scope request** | "Should I buy Apple stock?" | Refuses: no investment advice, and no answer without evidence. |
+
+**Corpus:** 10-K annual reports for **Apple, Microsoft, NVIDIA, Amazon and Alphabet, fiscal 2021–2025** (25 filings) pulled from SEC EDGAR, converted to Markdown with Docling. Tables are extracted as structured rows, so a cited figure points at the actual table cell rather than at flattened text.
+
+---
+
+## How it works
 
 ```mermaid
 flowchart LR
-    user[Analyst] --> browser[React SPA]
-
-    subgraph frontend[Frontend Service]
-        app[Vite build<br/>React + TypeScript]
-    end
-
-    subgraph backend[Backend Service]
-        api[FastAPI API]
-        authz[Auth dependency]
-        chat[Chat routes]
-        retrieval[Hybrid retrieval]
-        grounding[Grounding validator]
-        assistant[LLM orchestration]
-    end
-
-    subgraph supabase[Supabase]
-        auth[Auth]
-        db[(Postgres<br/>profiles, chats, documents, chunks)]
-        vector[pgvector]
-        fts[Full-text search]
-    end
-
-    subgraph ingestion[Ingestion Pipeline]
-        filings[SEC filings]
-        markdown[Markdown corpus]
-        chunks[Chunker]
-        embed[Embedding batches]
-    end
-
-    openai[OpenAI<br/>Embeddings + LLM]
-
-    app --> browser
-    browser -->|email session| auth
-    browser -->|JWT + chat request| api
-    api --> authz
-    authz -->|verify token| auth
-    chat --> db
-    chat --> retrieval
-    retrieval --> vector
-    retrieval --> fts
-    retrieval --> db
-    retrieval --> grounding
-    grounding --> assistant
-    assistant --> openai
-    api -->|stream response| browser
-
-    filings --> markdown
-    markdown --> chunks
-    chunks --> embed
-    embed --> openai
-    embed --> db
+    U[Analyst] --> FE[React SPA<br/>AI SDK streaming]
+    FE -->|JWT| API[FastAPI]
+    API --> T[ChatTurn]
+    T --> G{{LangGraph turn graph}}
+    G --> R[choose_route<br/>router + prefetch search in parallel]
+    R -->|greeting / scope| D[reply_directly]
+    R -->|focused fact| Q[quick_rag<br/>1 search, 1 model call]
+    R -->|comparison / synthesis| A[deep_rag<br/>agentic research loop]
+    Q & A --> V[Grounding validator]
+    V --> T
+    T -->|SSE: stages, route, text, citations| FE
+    A <--> S[(Supabase Postgres<br/>pgvector + full-text)]
+    Q <--> S
+    G -.traces.-> LS[(LangSmith)]
 ```
 
-### RAG And Software Layers
+### Agentic RAG, step by step
 
-```mermaid
-flowchart TB
-    subgraph client[Client Layer]
-        ui[React chat UI]
-        session[Supabase browser session]
-        apiClient[Typed API client]
-    end
+1. **Route.** Greetings and "what's in the corpus?" questions get canned replies without calling an LLM. Everything else goes to a fast model with structured output (`ModelRouteDecision`): answer directly (product help only), `quick_rag`, or `deep_rag`. A regex gate escalates any "direct" decision that mentions a company, metric, form or period, so factual questions can never skip retrieval.
+2. **Prefetch.** While the router is thinking, the first hybrid search for the question runs in parallel. It is discarded for direct answers and reused by both RAG routes.
+3. **Retrieve (hybrid).** The question is embedded (`text-embedding-3-small`) for a pgvector HNSW search while Postgres full-text search runs over a generated `tsvector`. The two ranked lists are fused with **Reciprocal Rank Fusion**, and the neighbouring chunks of every hit are fetched in one query.
+4. **Answer.**
+   - *Quick RAG:* evidence candidates (exact quotes with ids) go to the fast model, which returns text plus the evidence ids it relied on.
+   - *Deep RAG:* the research agent starts from the prefetched evidence and may call `search_filings`, `read_chunk` and `read_surrounding_chunks` until it calls `submit_answer`.
+5. **Ground.** The validator maps evidence ids back to trusted chunks, checks keywords and every financial number against the quotes, and builds canonical citations (label, page, section, quote). In deep RAG one rejection is returned to the model to fix; a second fails the turn.
+6. **Stream and persist.** Stage events ("Searching filings", "Validating citations"...) stream live; answer text streams only after validation. The question, answer, citations, route and timings are saved atomically.
 
-    subgraph service[Application Layer]
-        routes[FastAPI routes]
-        deps[Auth dependencies]
-        store[ChatStore persistence]
-        stream[Streaming response boundary]
-    end
+### LangChain and LangGraph concepts used
 
-    subgraph rag[RAG Layer]
-        ingest[Markdown ingestion]
-        chunk[Document chunking]
-        embeddings[Embedding generation]
-        hybrid[Vector + keyword retrieval]
-        rrf[Reciprocal Rank Fusion]
-        cite[Citation validation]
-    end
+| Concept | Where | Why |
+| --- | --- | --- |
+| **`StateGraph` with typed state** | `app/chat/graph.py`, `app/assistant/agent.py` | The turn and the research loop are explicit state machines rather than hand-wired callbacks. |
+| **Conditional edges** | `pick_route`, `after_tools` | Route selection and the agent's tool-loop exit are graph edges you can read and test. |
+| **Runtime context (`context_schema`)** | `TurnContext`, `ResearchContext` | Models, retriever and validator are injected per run, so tests swap them without patching globals. |
+| **Custom stream mode** (`get_stream_writer`) | stage and route events | The UI shows real progress as each node runs. |
+| **`add_messages` reducer** | research state | Conversation history for the tool loop. |
+| **Structured output** (`with_structured_output`) | router, quick answer | Typed Pydantic decisions instead of parsing free text. |
+| **Tool calling** (`bind_tools`, `tool_choice="any"`) | research model | Forces every step to be a tool call, so the run always ends through `submit_answer`. |
+| **Runnable retry** (`with_retry`) | router | One retry on schema-invalid output. |
+| **Callbacks / tracing** (`LangChainTracer`) | `app/resources.py` | One LangSmith trace per chat turn, every node visible. |
 
-    subgraph data[Data Layer]
-        postgres[(Supabase Postgres)]
-        tables[Profiles, threads, messages,<br/>source_documents, document_chunks]
-        indexes[pgvector HNSW + GIN full-text indexes]
-    end
-
-    subgraph model[Model Layer]
-        openaiEmbed[OpenAI embedding model]
-        openaiChat[OpenAI chat model]
-    end
-
-    ui --> session --> apiClient --> routes
-    routes --> deps --> store --> postgres
-    routes --> stream
-    stream --> hybrid
-    ingest --> chunk --> embeddings --> openaiEmbed
-    embeddings --> tables
-    hybrid --> indexes
-    hybrid --> rrf --> cite --> openaiChat
-    tables --> postgres
-    indexes --> postgres
-```
-
-## Tech Stack
-
-| Area | Technology |
-| --- | --- |
-| Frontend | Vite, React, TypeScript, React Router, Tailwind CSS, shadcn/ui |
-| Auth | Supabase Auth |
-| Backend | Python 3.12, FastAPI, Uvicorn, Pydantic v2 |
-| Database | Supabase Postgres, SQLAlchemy models, Alembic migrations |
-| Retrieval | `pgvector`, Postgres full-text search, Reciprocal Rank Fusion |
-| AI | OpenAI embeddings, LangChain + LangGraph orchestration, LangSmith tracing |
-| Package management | `uv` for backend, `pnpm` for frontend |
-| Hosting target | Railway frontend service + Railway backend service + hosted Supabase |
-
-## Repository Layout
+### Backend modules
 
 ```text
-.
-|-- backend/              # FastAPI API, migrations, ingestion, tests
-|-- data/                 # Local corpus tooling and gitignored downloaded payloads
-|-- docs/                 # Architecture notes, setup guides, implementation plans
-|-- frontend/             # Vite React SPA
-|-- AGENTS.md             # Engineering rules for coding agents
-`-- README.md
+backend/app/
+├── resources.py      # clients built once per process: DB pool, OpenAI, Supabase, models, tracer
+├── chat/             # turn.py (persist + run), graph.py (LangGraph), routing, quick_rag, streaming
+├── assistant/        # agent.py (research loop), tools.py, models.py, outputs, instructions.md
+├── retrieval/        # hybrid queries, RRF fusion, batched neighbour reads
+├── grounding/        # evidence candidates + fail-closed validator
+├── auth/             # Supabase token verification with a short success cache
+└── database/         # engine, SQLAlchemy models, chat store
 ```
 
-## Implementation Details
+---
 
-### Frontend
+## Evaluation and verification
 
-The frontend is a plain React SPA. It handles UI state, routing, Supabase browser auth, and authenticated requests to FastAPI.
+### Automated tests (offline, deterministic)
 
-Key modules:
+About **400 backend tests** run in about 30 seconds with no network or database. LLMs are replaced by scripted fakes *at the model seam only*: the real LangGraph graphs, tools and grounding validator run in every test.
 
-- `frontend/src/lib/env.ts` validates browser-safe environment variables at startup.
-- `frontend/src/lib/supabase.ts` creates the Supabase browser client.
-- `frontend/src/lib/http.ts` wraps `fetch`, applies the API base URL, and attaches bearer tokens.
-- `frontend/src/lib/api.ts` exposes application API calls.
-- `frontend/src/pages/ChatPage.tsx` and `frontend/src/components/chat/*` render the chat workspace.
+- **Grounding contract:** forged evidence ids, numbers that are not in the quote, reversed current/prior-year values, uncited factual sentences, and insufficient-evidence refusals.
+- **Agent behaviour:** budgets at their exact limits, one-retry semantics, malformed tool arguments, parallel tool calls, cancellation of sibling tools, reused message ids, and 20 concurrent turns sharing no state.
+- **Wire contract:** the full SSE event sequence for every route, typed error codes that never leak exception text, persistence after a client disconnects, and ownership checks (403/404) running before any model call.
+- **Performance properties:** asserted with simulated latency (see below).
 
-The frontend must never contain the Supabase service role key, database URL, or OpenAI API key.
+### LangSmith evals
 
-### Backend
+`backend/evals/` runs the real turn graph against live services and scores each answer:
 
-The backend is the trusted application boundary. It verifies Supabase JWTs, owns privileged credentials, persists chat records, runs ingestion, and is the intended home for retrieval, grounding, and LLM orchestration.
+| Evaluator | Checks |
+| --- | --- |
+| `route_correct` | Greetings stay instant, product help stays direct, research questions use RAG. |
+| `completed` | The turn finished without a typed failure. |
+| `grounded` | A RAG answer either cites evidence or explicitly refuses, never neither. |
+| `cites_expected_company` | Citations come from the company the question is about. |
+| `keyword_coverage` | Expected concepts appear in the answer or its quotes. |
+| `refusal_correct` | Unanswerable questions are refused without citations. |
+| `faithfulness` (optional, LLM judge) | Every claim is supported by the quoted passages. |
+| `latency_ms` | End-to-end turn time. |
 
-Key modules:
-
-- `backend/app/main.py` creates the FastAPI app and CORS policy.
-- `backend/app/config.py` validates required server environment variables.
-- `backend/app/auth/dependencies.py` verifies authenticated users.
-- `backend/app/api/chat.py` exposes chat thread, message, and streaming endpoints.
-- `backend/app/database/chats.py` persists chat threads and messages.
-- `backend/app/database/models/*` defines SQLAlchemy models used by Alembic.
-- `backend/ingest/*` prepares Markdown filings, chunks text, generates embeddings, and writes source documents/chunks.
-
-### Ingestion
-
-The ingestion pipeline is deliberately two-stage. From the repository root, download SEC HTML and convert it into persistent normalized Markdown:
-
-```bash
-uv run data/download.py
-uv run --directory backend python ../data/html_to_markdown/convert_html_to_markdown.py --overwrite
-```
-
-The backend ingestion command then reads `data/Markdown/manifest.json`. A default or explicit dry run makes no OpenAI or database writes:
+The dataset combines routing cases, retrieval fixtures and the client brief's ten pilot questions (including one that must be refused).
 
 ```bash
 cd backend
-uv run document-copilot-ingest --dry-run --limit-documents 2
+uv run python -m evals.run_eval                       # local report
+uv run python -m evals.run_eval --judge --langsmith   # LangSmith experiment
 ```
 
-Make the first paid/database test one document and one chunk:
+Set `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` to trace every production turn as well. Tracing is off by default because traces contain questions and filing text.
 
-```bash
-cd backend
-uv run document-copilot-ingest --upload --limit-documents 1 --limit-chunks 1
-```
+### Independent review by AI test agents
 
-For a full upload, pass `--yes` deliberately:
+After the LangGraph migration I ran three **Codex** agents in parallel, each in its own git worktree with a narrow brief (graph edge cases, HTTP/SSE contract, performance claims). Their rules were to add tests only and mark any bug they found as a strict `xfail` with a reproduction. They found **8 real bugs**, including auth outages returning HTTP 500, duplicate concurrent token checks, and a failure count that let malformed answers bypass the retry limit. I fixed all eight, and their reproductions now run as regression tests.
 
-```bash
-cd backend
-uv run document-copilot-ingest --upload --yes
-```
+---
 
-### Database
+## Performance engineering
 
-Alembic owns schema changes. Migrations live in `backend/alembic/versions`.
+Profiling the request path turned up the following. Each fix has a test or benchmark (`backend/perf/bench_turn.py`, simulated latency):
 
-The database model includes:
+| Problem found | Fix | Result |
+| --- | --- | --- |
+| A new SQLAlchemy engine (connection pool), OpenAI client and Supabase client built **per chat request**, and never disposed | `Resources` built once in the FastAPI lifespan | 20 requests → 1 engine, 1 client |
+| Supabase Auth called on every API request | 30-second verified-token cache plus single-flight for concurrent requests | 12-request burst → 1 upstream call |
+| Router LLM call, then embedding, then search, all serial | Prefetch search runs alongside routing | 200 ms + 200 ms → **202 ms** |
+| Deep research spent its first model call asking to search | Agent starts from the prefetched evidence | 2 model calls + 1 search → **1 + 0** |
+| One neighbour query per search result (N+1) | One batched query | top_k round trips → 1 |
+| HNSW `ef_search` (40) silently capped the 50-candidate search | Raised per query | Full candidate set returned |
+| Every streamed token re-rendered and re-parsed the Markdown of the whole thread | Memoised messages | Only the streaming answer re-renders |
 
-- User profiles tied to Supabase Auth users.
-- Chat threads and chat messages.
-- Source documents with filing metadata.
-- Document chunks with text, metadata, embedding vectors, and search fields.
+---
 
-Supabase/Postgres-specific features such as `vector`, HNSW indexes, GIN indexes, generated search vectors, and RLS policies belong in explicit migration operations.
+## How I built it with AI-assisted engineering
+
+I used Claude Code and OpenAI Codex as implementation partners, with the context, plans and verification under my control. The repository is the record of that process.
+
+**1. Context first.** Before writing code I wrote the [client brief](docs/client-brief.md) (who the users are, what they pay for, why trust matters) and the [architecture spec](docs/architecture.md) (service boundaries, request flow, streaming contract, data model, grounding policy). I wrote [`AGENTS.md`](AGENTS.md) plus per-service `backend/AGENTS.md` and `frontend/AGENTS.md` as standing instructions for any coding agent: the locked stack, the dependency policy (justify every runtime dependency in the commit message), a single settings module, async-only request paths, and required test coverage. Every agent session started from the same ground rules.
+
+**2. A phased roadmap.** [`docs/todos.md`](docs/todos.md) breaks the product into vertical slices: foundation → auth → chat shell with a stubbed reply → ingestion → retrieval → agent and grounding → trust UI. Phase 3 deliberately shipped a fake assistant so the full stack (auth, persistence, streaming) was proven before any AI was added.
+
+**3. A written plan per phase.** Each phase got an implementation plan in [`docs/superpowers/plans/`](docs/superpowers/plans/) with its goal, architecture, global constraints, and checkbox tasks, for example the [adaptive routing plan](docs/superpowers/plans/2026-08-01-adaptive-chat-routing.md) and the [agent and grounding plan](docs/superpowers/plans/2026-08-01-phase-6-agent-grounding.md). Agents executed against the plan, and I reviewed the diffs.
+
+**4. Frontend → backend → RAG, in that order.** The frontend API layer (`env.ts` → `supabase.ts` → `http.ts` → `api.ts`) and the FastAPI auth boundary came first, then the chat shell, then Docling ingestion with table-aware chunking, then hybrid retrieval, then the agent and grounding, and finally the trust UI (live stages, citation chips, evidence rail).
+
+**5. Test-first, small commits.** Most features landed as `feat:` commits paired with their tests, followed by targeted `fix:` commits from review, for example *"canonicalize grounded citation metadata"* and *"validate agent retrieval context"*.
+
+**6. Architecture review and refactor.** Once the product worked, I ran a structured architecture review (Matt Pocock's *improve-codebase-architecture* method: find shallow modules, propose deeper ones). That led to the `Resources` seam and the LangGraph rewrite, which replaced 7 modules, 4 protocols and 3 threaded callbacks with one graph.
+
+**7. Independent verification.** Parallel Codex agents in isolated worktrees attacked the new code, as described in [Independent review by AI test agents](#independent-review-by-ai-test-agents). The pattern throughout: AI writes code against explicit context and plans, and tests plus review decide what ships.
+
+---
+
+## Tech stack
+
+| Layer | Technology |
+| --- | --- |
+| Frontend | React 19, TypeScript, Vite, Tailwind CSS, shadcn/ui, Vercel AI SDK (`useChat`), react-markdown + GFM |
+| Backend | Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2, Alembic, structlog, httpx |
+| AI | LangChain (`langchain-openai`), LangGraph, LangSmith, OpenAI chat and embedding models |
+| Data | Supabase Postgres, pgvector (HNSW), Postgres full-text search, Supabase Auth, row-level security |
+| Ingestion | SEC EDGAR, Docling (HTML → Markdown, hybrid chunking), tiktoken |
+| Quality | pytest, ruff, ESLint, TypeScript strict build |
+| Hosting | Railway (two services) + hosted Supabase |
+
+---
 
 ## Running locally
 
@@ -348,12 +310,12 @@ Frontend environment variables:
 
 ### 3. Load or update the filing corpus
 
-Set `USER_AGENT` in `data/download.py` to a real contact address before making
-SEC requests. From the repository root, download the configured filings and
-regenerate normalized Markdown:
+SEC EDGAR requires a real contact in the User-Agent. Pass it through
+`SEC_USER_AGENT` (it is never committed). From the repository root, download the
+configured filings and regenerate normalized Markdown:
 
 ```bash
-uv run data/download.py
+SEC_USER_AGENT="Document Copilot you@example.com" uv run data/download.py
 uv run --directory backend python ../data/html_to_markdown/convert_html_to_markdown.py --overwrite
 uv run --directory backend document-copilot-ingest --dry-run
 ```
@@ -509,11 +471,3 @@ Do not run ingestion from the browser or expose ingestion credentials to the fro
 - Verify Supabase JWTs at the FastAPI boundary before any database, retrieval, or LLM work.
 - Use the direct Supabase database URL for migrations, not the transaction pooler.
 
-## Roadmap
-
-- Implement production hybrid retrieval queries over `document_chunks`.
-- Add Reciprocal Rank Fusion and source passage expansion.
-- Replace the streaming stub with grounded assistant orchestration.
-- Add citation validation before assistant messages are persisted.
-- Add retrieval and grounding evaluation fixtures.
-- Add deployment configuration files once Railway services are finalized.
