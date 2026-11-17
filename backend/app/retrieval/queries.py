@@ -2,7 +2,7 @@ from collections.abc import Sequence
 from typing import Literal
 from uuid import UUID
 
-from sqlalchemy import Select, desc, func, select
+from sqlalchemy import Select, and_, desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.database.models.documents import DocumentChunk, DocumentTable, SourceDocument
@@ -111,6 +111,9 @@ def semantic_search(
 ) -> list[RankedChunk]:
     if limit < 1:
         return []
+    # pgvector's HNSW scan returns at most hnsw.ef_search rows (default 40), so a
+    # larger LIMIT silently came back short. Raise it for this transaction only.
+    session.execute(select(func.set_config("hnsw.ef_search", str(max(limit, 40)), True)))
     rows = session.execute(
         build_semantic_statement(query_embedding, limit=limit, filters=filters)
     ).all()
@@ -196,3 +199,53 @@ def read_surrounding_chunks(
     previous = [item for item in neighbors if item.chunk_index < chunk.chunk_index]
     next_chunks = [item for item in neighbors if item.chunk_index > chunk.chunk_index]
     return previous, next_chunks
+
+
+def read_neighbors_for_many(
+    session: Session,
+    chunks: Sequence[ChunkReference],
+    *,
+    window: int,
+) -> dict[UUID, tuple[list[ChunkReference], list[ChunkReference]]]:
+    """Neighbours for many centre chunks in one round trip.
+
+    Same rules as read_surrounding_chunks: same document, within `window`
+    positions, and inside the same table when the centre chunk is a table row.
+    """
+    if window < 1 or not chunks:
+        return {chunk.chunk_id: ([], []) for chunk in chunks}
+    ranges = [
+        and_(
+            DocumentChunk.document_id == chunk.document_id,
+            DocumentChunk.chunk_index >= chunk.chunk_index - window,
+            DocumentChunk.chunk_index <= chunk.chunk_index + window,
+        )
+        for chunk in chunks
+    ]
+    statement = (
+        select(*_base_columns())
+        .join(SourceDocument, SourceDocument.id == DocumentChunk.document_id)
+        .outerjoin(DocumentTable, DocumentTable.id == DocumentChunk.table_id)
+        .where(or_(*ranges))
+        .order_by(DocumentChunk.document_id, DocumentChunk.chunk_index)
+    )
+    rows = [chunk_reference_from_row(row) for row in session.execute(statement).all()]
+    return {chunk.chunk_id: _split_neighbors(chunk, rows, window) for chunk in chunks}
+
+
+def _split_neighbors(
+    center: ChunkReference,
+    candidates: Sequence[ChunkReference],
+    window: int,
+) -> tuple[list[ChunkReference], list[ChunkReference]]:
+    neighbors = [
+        item
+        for item in candidates
+        if item.document_id == center.document_id
+        and item.chunk_id != center.chunk_id
+        and abs(item.chunk_index - center.chunk_index) <= window
+        and (center.table_id is None or item.table_id == center.table_id)
+    ]
+    previous = [item for item in neighbors if item.chunk_index < center.chunk_index]
+    following = [item for item in neighbors if item.chunk_index > center.chunk_index]
+    return previous, following

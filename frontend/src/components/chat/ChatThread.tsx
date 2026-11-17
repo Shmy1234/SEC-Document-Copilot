@@ -117,6 +117,14 @@ export function ChatThread({ threadId, hasTitle, onThreadChanged }: ChatThreadPr
     lastChipRef.current = null
   }, [])
 
+  const selectCitation = useCallback(
+    (messageId: string, citation: { citation_index: number }, chip: HTMLButtonElement | null) => {
+      lastChipRef.current = chip
+      setSelected({ messageId, citationIndex: citation.citation_index })
+    },
+    [],
+  )
+
   const lastMessage = messages.at(-1)
   // Turn failures render beside the turn that failed; only transport and history
   // problems belong at the bottom of the thread.
@@ -179,10 +187,7 @@ export function ChatThread({ threadId, hasTitle, onThreadChanged }: ChatThreadPr
                       {messageText(message) ? (
                         <AssistantMessage
                           message={message}
-                          onCitationSelect={(messageId, citation, chip) => {
-                            lastChipRef.current = chip
-                            setSelected({ messageId, citationIndex: citation.citation_index })
-                          }}
+                          onCitationSelect={selectCitation}
                           selectedCitationIndex={
                             selected?.messageId === message.id ? selected.citationIndex : null
                           }

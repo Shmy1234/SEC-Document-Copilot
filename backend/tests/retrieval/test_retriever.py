@@ -47,13 +47,14 @@ def test_retrieve_runs_both_queries_fuses_and_attaches_neighbors(monkeypatch):
         calls.append(("full_text", query, limit, filters))
         return [RankedChunk(chunk=make_chunk(1), rank=1, score=2.5, source="full_text")]
 
-    def fake_neighbors(session, chunk, *, window):
+    def fake_neighbors(session, chunks, *, window):
         assert window == 1
-        return [make_chunk(0)], [make_chunk(2)]
+        calls.append(("neighbors", [chunk.chunk_id for chunk in chunks]))
+        return {chunk.chunk_id: ([make_chunk(0)], [make_chunk(2)]) for chunk in chunks}
 
     monkeypatch.setattr("app.retrieval.retriever.semantic_search", fake_semantic_search)
     monkeypatch.setattr("app.retrieval.retriever.full_text_search", fake_full_text_search)
-    monkeypatch.setattr("app.retrieval.retriever.read_surrounding_chunks", fake_neighbors)
+    monkeypatch.setattr("app.retrieval.retriever.read_neighbors_for_many", fake_neighbors)
 
     retriever = DocumentRetriever(session_factory=fake_session_factory, embedder=FakeEmbedder())
     passages = asyncio.run(
@@ -70,8 +71,8 @@ def test_retrieve_runs_both_queries_fuses_and_attaches_neighbors(monkeypatch):
     assert passages[0].center.full_text_rank == 1
     assert passages[0].previous_chunks[0].chunk_index == 0
     assert passages[0].next_chunks[0].chunk_index == 2
-    assert calls[0][0] == "semantic"
-    assert calls[1][0] == "full_text"
+    assert {call[0] for call in calls[:2]} == {"semantic", "full_text"}
+    assert calls[2] == ("neighbors", [make_chunk(1).chunk_id])
 
 
 def test_retriever_reads_a_chunk_without_blocking_the_event_loop(monkeypatch):
@@ -105,3 +106,50 @@ def test_retriever_reads_surrounding_chunks(monkeypatch):
     result = asyncio.run(retriever.read_surrounding_chunks(expected.chunk_id, window=2))
 
     assert result == {"previous_chunks": [make_chunk(0)], "next_chunks": [make_chunk(2)]}
+
+
+def test_full_text_search_runs_while_the_query_is_embedded(monkeypatch):
+    import threading
+
+    full_text_done = threading.Event()
+
+    class SlowEmbedder:
+        async def embed_query(self, query):
+            # Full-text must finish without waiting for the embedding.
+            for _ in range(200):
+                if full_text_done.is_set():
+                    return [0.1]
+                await asyncio.sleep(0.005)
+            raise AssertionError("full-text search waited for the embedding")
+
+    def fake_full_text(session, query, *, limit, filters):
+        full_text_done.set()
+        return []
+
+    monkeypatch.setattr("app.retrieval.retriever.full_text_search", fake_full_text)
+    monkeypatch.setattr("app.retrieval.retriever.semantic_search", lambda *a, **k: [])
+    monkeypatch.setattr("app.retrieval.retriever.read_neighbors_for_many", lambda *a, **k: {})
+    retriever = DocumentRetriever(session_factory=fake_session_factory, embedder=SlowEmbedder())
+
+    assert asyncio.run(retriever.retrieve("q", top_k=1, candidate_k=5)) == []
+
+
+def test_neighbors_for_all_results_are_read_in_one_query(monkeypatch):
+    batches = []
+
+    def fake_neighbors(session, chunks, *, window):
+        batches.append(len(chunks))
+        return {chunk.chunk_id: ([], []) for chunk in chunks}
+
+    ranked = [
+        RankedChunk(chunk=make_chunk(n), rank=n, score=1.0, source="semantic") for n in range(1, 6)
+    ]
+    monkeypatch.setattr("app.retrieval.retriever.semantic_search", lambda *a, **k: ranked)
+    monkeypatch.setattr("app.retrieval.retriever.full_text_search", lambda *a, **k: [])
+    monkeypatch.setattr("app.retrieval.retriever.read_neighbors_for_many", fake_neighbors)
+    retriever = DocumentRetriever(session_factory=fake_session_factory, embedder=FakeEmbedder())
+
+    passages = asyncio.run(retriever.retrieve("Apple revenue mix", top_k=5, candidate_k=5))
+
+    assert len(passages) == 5
+    assert batches == [5]

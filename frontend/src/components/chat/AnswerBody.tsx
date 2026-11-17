@@ -1,3 +1,4 @@
+import { memo, type ReactNode } from 'react'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
@@ -10,19 +11,20 @@ type AnswerBodyProps = {
  * Answers are markdown because filing answers are frequently tabular. Rendered to
  * React elements rather than HTML, so model output can never inject markup.
  */
-export function AnswerBody({ text, streaming }: AnswerBodyProps) {
+const remarkPlugins = [remarkGfm]
+const components = {
+  table: ({ children }: { children?: ReactNode }) => (
+    <div className="my-3 overflow-x-auto rounded-md border">
+      <table>{children}</table>
+    </div>
+  ),
+}
+
+/** Memoised so markdown is re-parsed only when this answer's text changes. */
+export const AnswerBody = memo(function AnswerBody({ text, streaming }: AnswerBodyProps) {
   return (
     <div className="answer-prose">
-      <Markdown
-        components={{
-          table: ({ children }) => (
-            <div className="my-3 overflow-x-auto rounded-md border">
-              <table>{children}</table>
-            </div>
-          ),
-        }}
-        remarkPlugins={[remarkGfm]}
-      >
+      <Markdown components={components} remarkPlugins={remarkPlugins}>
         {text}
       </Markdown>
       {streaming ? (
@@ -33,4 +35,4 @@ export function AnswerBody({ text, streaming }: AnswerBodyProps) {
       ) : null}
     </div>
   )
-}
+})
