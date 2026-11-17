@@ -1,18 +1,16 @@
+"""One-pass RAG: one search (already run during routing), one model call."""
+
 import json
-from typing import Protocol
+from collections.abc import Sequence
 
-from pydantic_ai import Agent
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.openai import OpenAIProvider
-from pydantic_ai.usage import UsageLimits
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import Runnable
 
-from app.assistant.deps import StageCallback, ignore_stage
+from app.assistant.deps import StageCallback
 from app.assistant.outputs import AgentAnswer, GroundedAnswer
-from app.chat.stages import RetrievalError
-from app.config import settings
 from app.grounding.evidence import build_evidence_candidates
 from app.grounding.validator import GroundingValidator
-from app.retrieval.retriever import DocumentRetriever
+from app.retrieval.schemas import SourcePassage
 
 INSUFFICIENT_EVIDENCE_ANSWER = "The corpus does not contain enough evidence to answer that question."
 
@@ -24,59 +22,29 @@ or evidence ids in the answer text.
 """
 
 
-class QuickAnswerRunner(Protocol):
-    async def run(self, prompt: str, *, usage_limits: UsageLimits): ...
+async def answer_from_passages(
+    question: str,
+    passages: Sequence[SourcePassage],
+    *,
+    answer_model: Runnable[list[BaseMessage], AgentAnswer],
+    grounding_validator: GroundingValidator,
+    report_stage: StageCallback,
+) -> GroundedAnswer:
+    candidates = build_evidence_candidates(passages, question)
+    if not candidates:
+        return GroundedAnswer(answer=INSUFFICIENT_EVIDENCE_ANSWER)
 
-
-_fast_model = OpenAIChatModel(
-    settings.OPENAI_FAST_MODEL.removeprefix("openai:"),
-    provider=OpenAIProvider(api_key=settings.OPENAI_API_KEY),
-)
-
-quick_answer_agent = Agent(
-    _fast_model,
-    output_type=AgentAnswer,
-    instructions=QUICK_RAG_INSTRUCTIONS,
-    retries=0,
-)
-
-
-class QuickRagRunner:
-    def __init__(self, answer_runner: QuickAnswerRunner = quick_answer_agent) -> None:
-        self._answer_runner = answer_runner
-
-    async def run(
-        self,
-        prompt: str,
-        *,
-        retriever: DocumentRetriever,
-        grounding_validator: GroundingValidator,
-        on_stage: StageCallback | None = None,
-    ) -> GroundedAnswer:
-        report_stage = on_stage or ignore_stage
-        await report_stage("searching")
-        try:
-            passages = await retriever.retrieve(prompt, top_k=5, candidate_k=50)
-        except Exception as error:
-            raise RetrievalError("filing search failed") from error
-
-        candidates = build_evidence_candidates(passages, prompt)
-        if not candidates:
-            return GroundedAnswer(answer=INSUFFICIENT_EVIDENCE_ANSWER)
-
-        await report_stage("analyzing")
-        payload = {
-            "question": prompt,
-            "evidence": [candidate.model_dump(mode="json") for candidate in candidates],
-        }
-        result = await self._answer_runner.run(
-            json.dumps(payload),
-            usage_limits=UsageLimits(request_limit=1),
-        )
-        evidence_index = {candidate.evidence_id: candidate for candidate in candidates}
-        await report_stage("validating")
-        return grounding_validator.validate(
-            result.output,
-            passages,
-            evidence_candidates=evidence_index,
-        )
+    await report_stage("analyzing")
+    payload = {
+        "question": question,
+        "evidence": [candidate.model_dump(mode="json") for candidate in candidates],
+    }
+    draft = await answer_model.ainvoke(
+        [SystemMessage(QUICK_RAG_INSTRUCTIONS), HumanMessage(json.dumps(payload))]
+    )
+    await report_stage("validating")
+    return grounding_validator.validate(
+        draft,
+        passages,
+        evidence_candidates={candidate.evidence_id: candidate for candidate in candidates},
+    )

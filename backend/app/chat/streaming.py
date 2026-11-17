@@ -1,137 +1,94 @@
+"""Turn events → AI SDK UI message stream (server-sent events)."""
+
 import asyncio
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import AsyncIterator
 
 import structlog
 
 from app.assistant.outputs import GroundedAnswer
-from app.chat.routing import ChatRoute
 from app.chat.stages import Stage, error_code_for
+from app.chat.turn import AnswerEvent, RouteEvent, StageEvent, TurnEvent
 
-StageReporter = Callable[[Stage], Awaitable[None]]
-AnswerReporter = Callable[[GroundedAnswer], Awaitable[None]]
-RouteReporter = Callable[[ChatRoute], Awaitable[None]]
-TurnRunner = Callable[[StageReporter, AnswerReporter, RouteReporter], Awaitable[GroundedAnswer]]
 logger = structlog.get_logger(__name__)
 
-# A browser that navigates away or closes mid-turn makes Starlette cancel this
-# generator. asyncio holds only weak references to tasks, so without a strong
-# reference here the orchestration would be collected mid-flight and the answer
-# would never be persisted. Turns finish and save whether or not anyone is
-# listening.
-_running_turns: set[asyncio.Task[GroundedAnswer]] = set()
+# A browser that navigates away or closes mid-turn makes Starlette cancel the
+# response generator. The turn is drained by its own task, held here because
+# asyncio keeps only weak references to tasks: turns finish and save whether or
+# not anyone is listening.
+_running_turns: set[asyncio.Task[None]] = set()
+
+_DONE = object()
 
 
-def _release_turn(task: asyncio.Task[GroundedAnswer]) -> None:
+def _release_turn(task: asyncio.Task[None]) -> None:
     _running_turns.discard(task)
     # A turn whose reader disconnected is never awaited. Retrieve the outcome so
-    # a failure does not resurface as an unretrieved task exception at collection
-    # time; connected turns are logged with their stage below, and every failure
-    # is recorded against the thread by the orchestrator either way.
+    # a failure does not resurface as an unretrieved task exception; every
+    # failure is recorded against the thread by ChatTurn either way.
     if not task.cancelled():
         task.exception()
 
 
-@dataclass(frozen=True)
-class _Route:
-    """Distinguishes a route update from the other queue payloads."""
-
-    route: ChatRoute
-
-
-async def stream_grounded_answer(
-    answer: GroundedAnswer,
-    *,
-    chunk_size: int = 80,
-) -> AsyncIterator[str]:
-    if chunk_size < 1:
-        raise ValueError("chunk_size must be greater than zero")
-
-    yield _event({"type": "start", "messageId": "assistant-message"})
-    async for event in _answer_events(answer, chunk_size):
-        yield event
-
-
 async def stream_chat_turn(
-    run_turn: TurnRunner,
+    events: AsyncIterator[TurnEvent],
     *,
     chunk_size: int = 80,
 ) -> AsyncIterator[str]:
-    """Run one turn inside the response stream so status reflects real progress.
+    """Emit each event as soon as the turn produces it.
 
-    Orchestration runs as a task that pushes stage identifiers onto a queue; this
-    generator drains the queue as they arrive, so a status event is only emitted
-    once its work has actually started.
+    The event iterator is drained by a detached task into a queue, so a status
+    part is sent only once its work has started and the turn survives the
+    client going away.
     """
     if chunk_size < 1:
         raise ValueError("chunk_size must be greater than zero")
 
-    queue: asyncio.Queue[Stage | GroundedAnswer | _Route | None] = asyncio.Queue()
+    queue: asyncio.Queue[TurnEvent | object] = asyncio.Queue()
     current_stage: Stage | None = None
-    answer_was_streamed = False
 
-    async def report_stage(stage: Stage) -> None:
-        nonlocal current_stage
-        current_stage = stage
-        await queue.put(stage)
-
-    async def report_answer(answer: GroundedAnswer) -> None:
-        await queue.put(answer)
-
-    async def report_route(route: ChatRoute) -> None:
-        await queue.put(_Route(route))
-
-    async def runner() -> GroundedAnswer:
+    async def drain() -> None:
         try:
-            return await run_turn(report_stage, report_answer, report_route)
+            async for event in events:
+                await queue.put(event)
         finally:
-            await queue.put(None)
+            await queue.put(_DONE)
 
-    task = asyncio.create_task(runner())
+    task = asyncio.create_task(drain())
     _running_turns.add(task)
     task.add_done_callback(_release_turn)
     yield _event({"type": "start", "messageId": "assistant-message"})
 
-    while True:
-        update = await queue.get()
-        if update is None:
-            break
-        if isinstance(update, GroundedAnswer):
-            answer_was_streamed = True
-            async for event in _answer_content_events(update, chunk_size):
-                yield event
-            continue
-        if isinstance(update, _Route):
+    answered = False
+    while (update := await queue.get()) is not _DONE:
+        if isinstance(update, StageEvent):
+            current_stage = update.stage
+            yield _event({"type": "data-status", "data": {"stage": update.stage}})
+        elif isinstance(update, RouteEvent):
             yield _event({"type": "data-route", "data": {"route": update.route}})
-            continue
-        yield _event({"type": "data-status", "data": {"stage": update}})
+        elif isinstance(update, AnswerEvent):
+            answered = True
+            async for event in _answer_content_events(update.answer, chunk_size):
+                yield event
 
     try:
-        answer = await task
-    except Exception as error:  # Fail closed: the stream is already open, so
-        # every failure must become a typed code rather than a dropped
-        # connection. Covers usage limits, agent errors, and persistence alike;
-        # the traceback stays server-side.
+        await task
+    except Exception as error:
+        # Fail closed: the stream is already open, so every failure must become a
+        # typed code rather than a dropped connection. The traceback stays here.
         code = error_code_for(error)
         logger.exception("chat_turn_failed", error_code=code, stage=current_stage)
     else:
-        if answer_was_streamed:
-            yield _event({"type": "finish", "finishReason": "stop"})
+        if not answered:
+            code = "processing_failed"
+            logger.error("chat_turn_ended_without_answer", stage=current_stage)
         else:
-            async for event in _answer_events(answer, chunk_size):
-                yield event
-        return
+            yield _event({"type": "finish", "finishReason": "stop"})
+            return
 
     # Only the code crosses the wire — exception text never reaches the browser.
     yield _event({"type": "data-error", "data": {"code": code}})
     yield _event({"type": "finish", "finishReason": "error"})
-
-
-async def _answer_events(answer: GroundedAnswer, chunk_size: int) -> AsyncIterator[str]:
-    async for event in _answer_content_events(answer, chunk_size):
-        yield event
-    yield _event({"type": "finish", "finishReason": "stop"})
 
 
 async def _answer_content_events(answer: GroundedAnswer, chunk_size: int) -> AsyncIterator[str]:

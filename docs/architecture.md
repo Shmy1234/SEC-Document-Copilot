@@ -16,7 +16,7 @@ flowchart LR
 
     subgraph railway[Railway]
         frontend[Frontend service<br/>Vite build]
-        backend[Backend service<br/>FastAPI + PydanticAI]
+        backend[Backend service<br/>FastAPI + LangGraph]
     end
 
     subgraph supabase[Supabase]
@@ -48,7 +48,7 @@ flowchart LR
 - Keep the backend authoritative: retrieval, grounding, citation checks, tool execution, and database writes happen in FastAPI.
 - Use Supabase for identity and durable product state: users, chat threads, source documents, chunks, embeddings, and citation metadata.
 - Use Supabase `pgvector` for semantic retrieval and Postgres full-text search for keyword retrieval.
-- Make the LLM path typed and testable by using PydanticAI agents with explicit dependencies, outputs, and tool boundaries.
+- Make the LLM path typed and testable with a LangGraph turn graph whose models, retriever and validator are injected, with typed outputs and bounded tools.
 - Preserve a simple deployment model on Railway: one frontend service, one stateless backend service, and hosted Supabase.
 
 ## Stack
@@ -66,7 +66,9 @@ Backend:
 - Python 3.12+
 - FastAPI + Uvicorn
 - Pydantic v2 + pydantic-settings
-- PydanticAI for typed LLM orchestration
+- LangChain (`langchain-core`, `langchain-openai`) for model calls
+- LangGraph for turn orchestration and the research tool loop
+- LangSmith for optional tracing
 - OpenAI SDK for generation and embeddings
 - Supabase Python client for server-side database access
 - SQLAlchemy models + Alembic migrations for schema management
@@ -97,7 +99,7 @@ Supabase is responsible for authentication and durable product state. Browser ac
 5. The frontend sends the Supabase access token as `Authorization: Bearer <token>`.
 6. FastAPI verifies the token with Supabase Auth before doing any retrieval or LLM work.
 7. FastAPI creates a request-scoped context containing the authenticated user, chat thread, Supabase client, retrieval service, citation policy, and LLM settings.
-8. A PydanticAI agent retrieves relevant document chunks, generates a grounded answer, and returns typed output containing answer text and citations.
+8. The LangGraph turn graph routes the question, retrieves relevant document chunks, generates an answer, and holds it to the grounding contract.
 9. FastAPI streams assistant message parts back to the browser in the format expected by the AI SDK client.
 10. FastAPI persists the final user message, assistant message, cited chunks, and usage metadata to Supabase.
 
@@ -135,56 +137,62 @@ The exact API surface should be verified during implementation against the insta
 
 ## Backend LLM Layer
 
-PydanticAI should be introduced as the backend's orchestration layer for answer generation. It replaces ad hoc prompt calls with a typed agent boundary.
-
-Recommended backend modules:
+LLM orchestration uses LangChain for model calls, LangGraph for the turn's control flow, and LangSmith (optional) for tracing. They replaced PydanticAI so that one framework owns routing, tool calling and progress streaming, and so every step of a turn can be traced and evaluated in LangSmith.
 
 ```text
 backend/app/
-├── api/
-│   └── chat.py                 # FastAPI routes for chat threads and streaming
+├── main.py                     # FastAPI app; lifespan builds and closes Resources
+├── resources.py                # Process-lifetime adapters: DB engine, OpenAI, Supabase,
+│                               #   httpx, token verifier, chat models, LangSmith tracer
+├── api/chat.py                 # Routes; dependencies read app.state.resources
 ├── auth/
-│   └── dependencies.py         # Supabase JWT verification and current user dependency
+│   ├── dependencies.py         # Bearer parsing + current-user dependency
+│   └── verifier.py             # Supabase token verification with a short success cache
 ├── chat/
-│   ├── orchestrator.py         # Coordinates one chat turn end-to-end
-│   ├── messages.py             # Converts AI SDK messages to and from internal message types
-│   └── streaming.py            # Emits AI SDK-compatible streaming events
+│   ├── turn.py                 # ChatTurn.run: persist question → run graph → persist answer
+│   ├── graph.py                # LangGraph turn graph: choose_route → reply / quick_rag / deep_rag
+│   ├── routing.py              # Canned replies, direct-answer safety gate, route_question
+│   ├── quick_rag.py            # One model call over prefetched evidence
+│   ├── streaming.py            # Turn events → AI SDK SSE parts; detached so turns finish
+│   └── stages.py               # Stage names, typed errors, error codes
 ├── assistant/
-│   ├── agent.py                # PydanticAI agent definition
-│   ├── deps.py                 # Runtime dependency dataclass for the agent
-│   ├── outputs.py              # GroundedAnswer, Citation, and SourcePassage
+│   ├── models.py               # ChatModels: route / quick_answer / research runnables
+│   ├── agent.py                # Deep research loop as a LangGraph graph (tools until submit_answer)
+│   ├── tools.py                # Tool schemas and execution, registering trusted evidence
+│   ├── deps.py                 # DocumentAgentDeps: the turn's evidence session
+│   ├── outputs.py              # AgentAnswer, GroundedAnswer, Citation
 │   └── instructions.md         # System instructions and product contract
-├── retrieval/
-│   ├── queries.py              # pgvector and full-text SQL queries
-│   ├── fusion.py               # Reciprocal Rank Fusion for hybrid search
-│   └── retriever.py            # Query-to-source-passage retrieval logic
-├── grounding/
-│   └── validator.py            # Ensures citations map to retrieved passages
-└── database/
-    ├── supabase.py             # Supabase client construction
-    ├── models.py               # SQLAlchemy table models used by Alembic autogenerate
-    ├── chats.py                # Chat, thread, message, and citation persistence
-    └── documents.py            # Source document, chunk, embedding, and search queries
+├── retrieval/                  # Hybrid pgvector + full-text search, RRF fusion
+├── grounding/                  # Evidence candidates and the grounding validator
+└── database/                   # Engine, Supabase client, SQLAlchemy models, chat store
 ```
 
-These names should follow the product workflow rather than a generic service layer. `chat/orchestrator.py` owns the full turn lifecycle, `assistant/agent.py` owns the LLM boundary, `retrieval/` owns hybrid source-passage search, and `grounding/` owns the trust contract that answers must cite retrieved evidence.
+### Turn graph
 
-The agent should receive explicit dependencies rather than reaching into globals:
-
-```python
-@dataclass
-class DocumentAgentDeps:
-    user_id: str
-    thread_id: str
-    retriever: DocumentRetriever
-    grounding_validator: GroundingValidator
-
-
-class GroundedAnswer(BaseModel):
-    answer: str
-    citations: list[Citation]
-    cited_passages: list[SourcePassage]
+```mermaid
+flowchart LR
+    start([question]) --> choose_route
+    choose_route -->|instant / direct| reply_directly
+    choose_route -->|quick_rag| quick_rag
+    choose_route -->|deep_rag| deep_rag
+    reply_directly --> done([answer])
+    quick_rag --> done
+    deep_rag --> done
 ```
+
+- `choose_route` answers greetings and scope questions with canned text. Otherwise it runs the routing model **and the first hybrid search in parallel**. The search is discarded for direct answers, and it feeds both RAG routes.
+- `quick_rag` makes one structured model call over the prefetched evidence.
+- `deep_rag` runs the research graph (`call_model ⇄ run_tools`). The model starts from the prefetched search, may call `search_filings`, `read_chunk`, `read_surrounding_chunks`, and must finish with `submit_answer`. That answer is checked by the grounding validator; one rejection is returned to the model to fix, a second fails the turn. Request and tool-call budgets bound the loop.
+- Nodes publish `{"stage": ...}` and `{"route": ...}` on LangGraph's custom stream; `ChatTurn` turns them into typed events and `streaming.py` into AI SDK parts.
+- Answer text is streamed only after it passes grounding, so the browser never shows an unverified claim.
+
+### Models and tests
+
+`ChatModels` holds three LangChain runnables over a message list (`route`, `quick_answer`, `research`). Production builds them from `ChatOpenAI` (`with_structured_output` / `bind_tools`); tests substitute scripted fakes at that seam and run the real graphs, tools and grounding validator.
+
+### Tracing
+
+Set `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` to send a trace per turn (run name `chat_turn`, tagged with the thread id) to `LANGSMITH_PROJECT`. The tracer is built from settings in `resources.py` rather than read from the process environment, and is flushed on shutdown.
 
 The agent's instructions should encode the product contract:
 
@@ -194,7 +202,7 @@ The agent's instructions should encode the product contract:
 - Do not provide stock recommendations or investment advice.
 - Keep answers concise enough for analyst review, but include enough cited passages to verify the answer.
 
-Retrieval and grounding remain independent from PydanticAI. This keeps ingestion, retrieval tests, and citation validation testable without invoking the LLM.
+Retrieval and grounding remain independent from LangChain and LangGraph. This keeps ingestion, retrieval tests, and citation validation testable without invoking the LLM.
 
 ## Retrieval Strategy
 
@@ -206,7 +214,7 @@ Document Copilot uses hybrid retrieval:
 4. Fuse the two ranked lists in Python with Reciprocal Rank Fusion.
 5. Fetch the selected chunks, source document metadata, and optional neighboring chunks for grounding.
 
-This keeps the database responsible for efficient ranked retrieval and keeps the application responsible for product-specific ranking policy. The first implementation should avoid agent-generated SQL; the PydanticAI agent receives bounded tools such as `search_filings`, `read_chunk`, and `read_surrounding_chunks`.
+This keeps the database responsible for efficient ranked retrieval and keeps the application responsible for product-specific ranking policy. The first implementation should avoid agent-generated SQL; the research loop receives bounded tools such as `search_filings`, `read_chunk`, and `read_surrounding_chunks`.
 
 ## Supabase and FastAPI Communication
 
@@ -388,7 +396,7 @@ Supabase remains hosted and stores the durable retrieval data. The Railway backe
 8. Add Markdown ingestion, chunking, embeddings, and Supabase writes.
 9. Add semantic search with `pgvector`.
 10. Add Postgres full-text search and Python RRF fusion.
-11. Add PydanticAI document agent with typed dependencies and typed answer output.
+11. Add the LangGraph turn graph and research loop with typed answer output.
 12. Add citation validation and grounding enforcement.
 13. Add final UI for citations, source passages, empty states, and errors.
 

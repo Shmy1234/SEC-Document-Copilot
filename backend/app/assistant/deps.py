@@ -26,19 +26,17 @@ class GroundingValidator(Protocol):
 
 
 class DocumentAgentDeps:
+    """Evidence gathered during one turn: what was retrieved and what may be cited."""
+
     def __init__(
         self,
         *,
-        user_id: UUID,
-        thread_id: UUID,
         retriever: DocumentRetriever,
         grounding_validator: GroundingValidator,
         retrieved_passages: list[SourcePassage] | None = None,
         retrieval_filters: RetrievalFilters | None = None,
         on_stage: StageCallback | None = None,
     ) -> None:
-        self.user_id = user_id
-        self.thread_id = thread_id
         self.retriever = retriever
         self.grounding_validator = grounding_validator
         self.on_stage = on_stage or ignore_stage

@@ -1,14 +1,14 @@
 import asyncio
 import json
 from datetime import date
-from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableLambda
 
 from app.assistant.outputs import AgentAnswer, CitationDraft
-from app.chat.quick_rag import INSUFFICIENT_EVIDENCE_ANSWER, QuickRagRunner
-from app.chat.stages import RetrievalError
+from app.chat.quick_rag import INSUFFICIENT_EVIDENCE_ANSWER, answer_from_passages
 from app.grounding.validator import GroundingError, GroundingValidator
 from app.retrieval.schemas import ChunkReference, FusedChunk, SourcePassage
 
@@ -32,75 +32,57 @@ def passage() -> SourcePassage:
     return SourcePassage(center=FusedChunk(chunk=chunk, rrf_score=1.0))
 
 
-class FakeRetriever:
-    def __init__(self, passages):
-        self.passages = passages
-        self.calls = []
-
-    async def retrieve(self, query: str, **kwargs):
-        self.calls.append((query, kwargs))
-        return self.passages
-
-
-class EvidenceAnswerRunner:
+class EvidenceAnswerModel:
     def __init__(self, answer: str = "Services revenue increased 14% in fiscal 2025."):
         self.answer = answer
         self.calls = []
 
-    async def run(self, prompt: str, *, usage_limits):
-        payload = json.loads(prompt)
-        self.calls.append((payload, usage_limits))
-        evidence_id = payload["evidence"][0]["evidence_id"]
-        return SimpleNamespace(
-            output=AgentAnswer(
-                answer=self.answer,
-                citations=[CitationDraft(evidence_id=evidence_id)],
-            )
+    async def ainvoke(self, messages):
+        system, human = messages
+        assert isinstance(system, SystemMessage)
+        assert isinstance(human, HumanMessage)
+        payload = json.loads(human.content)
+        self.calls.append(payload)
+        return AgentAnswer(
+            answer=self.answer,
+            citations=[CitationDraft(evidence_id=payload["evidence"][0]["evidence_id"])],
         )
 
 
-def test_quick_rag_retrieves_once_and_returns_validated_citation():
-    retriever = FakeRetriever([passage()])
-    model = EvidenceAnswerRunner()
-    stages = []
-
+def answer(passages, model, stages=None):
     async def report(stage):
-        stages.append(stage)
+        if stages is not None:
+            stages.append(stage)
 
-    result = asyncio.run(
-        QuickRagRunner(model).run(
+    return asyncio.run(
+        answer_from_passages(
             "What happened to Services revenue?",
-            retriever=retriever,
+            passages,
+            answer_model=model,
             grounding_validator=GroundingValidator(),
-            on_stage=report,
+            report_stage=report,
         )
     )
 
-    assert retriever.calls == [
-        (
-            "What happened to Services revenue?",
-            {"top_k": 5, "candidate_k": 50},
-        )
-    ]
+
+def test_quick_rag_makes_one_model_call_and_returns_validated_citation():
+    model = EvidenceAnswerModel()
+    stages = []
+
+    result = answer([passage()], model, stages)
+
     assert len(model.calls) == 1
-    assert model.calls[0][0]["question"] == "What happened to Services revenue?"
-    assert model.calls[0][0]["evidence"][0]["exact_quote"] == passage().center.chunk.text
-    assert model.calls[0][1].request_limit == 1
+    assert model.calls[0]["question"] == "What happened to Services revenue?"
+    assert model.calls[0]["evidence"][0]["exact_quote"] == passage().center.chunk.text
     assert result.citations[0].chunk_id == passage().center.chunk.chunk_id
-    assert stages == ["searching", "analyzing", "validating"]
+    assert result.citations[0].quoted_text == passage().center.chunk.text
+    assert stages == ["analyzing", "validating"]
 
 
 def test_quick_rag_empty_result_skips_answer_model():
-    retriever = FakeRetriever([])
-    model = EvidenceAnswerRunner()
+    model = EvidenceAnswerModel()
 
-    result = asyncio.run(
-        QuickRagRunner(model).run(
-            "What happened?",
-            retriever=retriever,
-            grounding_validator=GroundingValidator(),
-        )
-    )
+    result = answer([], model)
 
     assert result.answer == INSUFFICIENT_EVIDENCE_ANSWER
     assert result.citations == []
@@ -108,30 +90,28 @@ def test_quick_rag_empty_result_skips_answer_model():
 
 
 def test_quick_rag_rejects_unsupported_model_answer():
-    class UnsupportedRunner:
-        async def run(self, prompt: str, *, usage_limits):
-            return SimpleNamespace(output=AgentAnswer(answer="Unsupported claim.", citations=[]))
+    unsupported = RunnableLambda(
+        lambda _messages: AgentAnswer(answer="Unsupported claim.", citations=[])
+    )
 
     with pytest.raises(GroundingError):
-        asyncio.run(
-            QuickRagRunner(UnsupportedRunner()).run(
-                "What happened to Services revenue?",
-                retriever=FakeRetriever([passage()]),
-                grounding_validator=GroundingValidator(),
-            )
+        answer([passage()], unsupported)
+
+
+def test_quick_rag_rejects_invented_evidence_ids():
+    invented = RunnableLambda(
+        lambda _messages: AgentAnswer(
+            answer="Services revenue increased 14% in fiscal 2025.",
+            citations=[CitationDraft(evidence_id=uuid4())],
         )
+    )
+
+    with pytest.raises(GroundingError):
+        answer([passage()], invented)
 
 
-def test_quick_rag_maps_retrieval_boundary_failure():
-    class BrokenRetriever:
-        async def retrieve(self, query: str, **kwargs):
-            raise RuntimeError("embedding service unavailable")
+def test_quick_rag_rejects_numbers_the_evidence_does_not_state():
+    model = EvidenceAnswerModel(answer="Services revenue increased 41% in fiscal 2025.")
 
-    with pytest.raises(RetrievalError):
-        asyncio.run(
-            QuickRagRunner(EvidenceAnswerRunner()).run(
-                "What happened to Services revenue?",
-                retriever=BrokenRetriever(),
-                grounding_validator=GroundingValidator(),
-            )
-        )
+    with pytest.raises(GroundingError):
+        answer([passage()], model)

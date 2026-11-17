@@ -103,3 +103,23 @@ def test_settings_database_url_uses_psycopg_three_driver() -> None:
     assert settings.sqlalchemy_database_url == (
         "postgresql+psycopg://postgres:password@db.project.supabase.co:5432/postgres"
     )
+
+
+def test_langsmith_tracing_is_off_unless_enabled() -> None:
+    settings = Settings(**VALID_SETTINGS, _env_file=None)
+
+    assert settings.LANGSMITH_TRACING is False
+    assert settings.LANGSMITH_PROJECT == "document-copilot"
+
+
+def test_langsmith_tracing_requires_an_api_key() -> None:
+    with pytest.raises(ValidationError, match="LANGSMITH_API_KEY"):
+        Settings(**VALID_SETTINGS, LANGSMITH_TRACING=True, _env_file=None)
+
+
+def test_langsmith_tracing_accepts_a_configured_key() -> None:
+    settings = Settings(
+        **VALID_SETTINGS, LANGSMITH_TRACING=True, LANGSMITH_API_KEY="lsv2-key", _env_file=None
+    )
+
+    assert settings.LANGSMITH_TRACING is True

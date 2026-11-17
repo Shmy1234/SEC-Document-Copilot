@@ -1,13 +1,9 @@
 import re
-from typing import Literal, Protocol
+from typing import Literal
 
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import Runnable
 from pydantic import BaseModel, model_validator
-from pydantic_ai import Agent
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.openai import OpenAIProvider
-from pydantic_ai.usage import UsageLimits
-
-from app.config import settings
 
 ChatRoute = Literal["instant", "direct", "quick_rag", "deep_rag"]
 ModelChatRoute = Literal["direct", "quick_rag", "deep_rag"]
@@ -96,23 +92,6 @@ class ModelRouteDecision(BaseModel):
         return self
 
 
-class RouteRunner(Protocol):
-    async def run(self, prompt: str, *, usage_limits: UsageLimits): ...
-
-
-_fast_model = OpenAIChatModel(
-    settings.OPENAI_FAST_MODEL.removeprefix("openai:"),
-    provider=OpenAIProvider(api_key=settings.OPENAI_API_KEY),
-)
-
-route_agent = Agent(
-    _fast_model,
-    output_type=ModelRouteDecision,
-    instructions=ROUTING_INSTRUCTIONS,
-    retries=1,
-)
-
-
 def _normalize(prompt: str) -> str:
     normalized = " ".join(prompt.split()).casefold()
     return _TRAILING_PUNCTUATION.sub("", normalized).strip()
@@ -142,17 +121,19 @@ def direct_response_allowed(prompt: str) -> bool:
     return not _FILING_FACT.search(normalized)
 
 
-class ChatRouter:
-    def __init__(self, runner: RouteRunner = route_agent) -> None:
-        self._runner = runner
+def routing_messages(prompt: str) -> list[BaseMessage]:
+    return [SystemMessage(ROUTING_INSTRUCTIONS), HumanMessage(prompt)]
 
-    async def route(self, prompt: str) -> RouteDecision:
-        response = instant_response(prompt)
-        if response is not None:
-            return RouteDecision(route="instant", answer=response)
 
-        result = await self._runner.run(prompt, usage_limits=UsageLimits(request_limit=1))
-        decision = result.output
-        if decision.route == "direct" and not direct_response_allowed(prompt):
-            return RouteDecision(route="quick_rag")
-        return RouteDecision(route=decision.route, answer=decision.answer)
+async def route_question(
+    prompt: str,
+    route_model: Runnable[list[BaseMessage], ModelRouteDecision],
+) -> RouteDecision:
+    response = instant_response(prompt)
+    if response is not None:
+        return RouteDecision(route="instant", answer=response)
+
+    decision = await route_model.ainvoke(routing_messages(prompt))
+    if decision.route == "direct" and not direct_response_allowed(prompt):
+        return RouteDecision(route="quick_rag")
+    return RouteDecision(route=decision.route, answer=decision.answer)

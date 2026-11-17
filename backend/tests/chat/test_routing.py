@@ -1,27 +1,37 @@
 import asyncio
-from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import ValidationError
 
 from app.chat.routing import (
     ROUTING_INSTRUCTIONS,
-    ChatRouter,
     ModelRouteDecision,
     RouteDecision,
+    route_question,
 )
 
 
 class FakeRouteRunner:
+    """Stands in for the structured-output route model."""
+
     def __init__(self, decision: ModelRouteDecision):
         self.decision = decision
         self.calls: list[str] = []
-        self.usage_limits = None
+        self.messages = []
 
-    async def run(self, prompt: str, *, usage_limits):
-        self.calls.append(prompt)
-        self.usage_limits = usage_limits
-        return SimpleNamespace(output=self.decision)
+    async def ainvoke(self, messages):
+        self.messages.append(messages)
+        self.calls.append(messages[-1].content)
+        return self.decision
+
+
+class ChatRouter:
+    def __init__(self, runner):
+        self._runner = runner
+
+    async def route(self, prompt):
+        return await route_question(prompt, self._runner)
 
 
 @pytest.mark.parametrize(
@@ -46,7 +56,9 @@ def test_near_match_uses_one_typed_model_call():
 
     assert decision == RouteDecision(route="quick_rag")
     assert runner.calls == ["Hi, summarize Apple's filing"]
-    assert runner.usage_limits.request_limit == 1
+    system, human = runner.messages[0]
+    assert isinstance(system, SystemMessage) and system.content == ROUTING_INSTRUCTIONS
+    assert isinstance(human, HumanMessage)
 
 
 def test_direct_route_reuses_answer_from_routing_call():

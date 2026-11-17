@@ -8,11 +8,14 @@ was the backend's largest source of latency and leaked database connections.
 from dataclasses import dataclass
 
 import httpx
+from langchain_core.tracers.langchain import LangChainTracer
+from langsmith import Client as LangSmithClient
 from openai import AsyncOpenAI
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from supabase import Client
 
+from app.assistant.models import ChatModels, build_chat_models
 from app.auth.verifier import SupabaseTokenVerifier
 from app.config import Settings
 from app.database.engine import create_database_engine, create_session_factory
@@ -25,10 +28,19 @@ class Resources:
     openai: AsyncOpenAI
     supabase: Client
     token_verifier: SupabaseTokenVerifier
+    models: ChatModels
+    tracer: LangChainTracer | None = None
     engine: Engine | None = None
     http: httpx.AsyncClient | None = None
 
+    @property
+    def callbacks(self) -> list[LangChainTracer]:
+        return [self.tracer] if self.tracer is not None else []
+
     async def aclose(self) -> None:
+        if self.tracer is not None:
+            # Traces are posted in the background; flush them before exit.
+            self.tracer.wait_for_futures()
         await self.openai.close()
         if self.http is not None:
             await self.http.aclose()
@@ -50,4 +62,16 @@ def build_resources(settings: Settings) -> Resources:
             supabase_url=settings.SUPABASE_URL,
             anon_key=settings.SUPABASE_ANON_KEY,
         ),
+        models=build_chat_models(settings),
+        tracer=build_tracer(settings),
     )
+
+
+def build_tracer(settings: Settings) -> LangChainTracer | None:
+    if not settings.LANGSMITH_TRACING:
+        return None
+    client = LangSmithClient(
+        api_key=settings.LANGSMITH_API_KEY,
+        api_url=settings.LANGSMITH_ENDPOINT,
+    )
+    return LangChainTracer(project_name=settings.LANGSMITH_PROJECT, client=client)
