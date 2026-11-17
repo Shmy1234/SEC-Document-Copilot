@@ -1,24 +1,24 @@
 import asyncio
+import json
 from datetime import date
-from pathlib import Path
-from types import SimpleNamespace
 from uuid import UUID, uuid4
 
-from pydantic_ai.models.test import TestModel
+import pytest
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
 from app.assistant.agent import (
-    agent_usage_limits,
-    document_agent,
-    prepare_retrieval_tool,
-    read_chunk,
-    read_surrounding_chunks,
-    search_filings,
+    INSTRUCTIONS,
+    PREFETCH_CALL_ID,
+    ResearchLimitExceeded,
+    ResearchLimits,
+    research,
 )
 from app.assistant.deps import DocumentAgentDeps
-from app.assistant.outputs import AgentAnswer, CitationDraft
-from app.grounding.evidence import EvidenceCandidate
-from app.grounding.validator import GroundingValidator
-from app.retrieval.schemas import ChunkReference, RetrievalFilters, SourcePassage
+from app.chat.stages import RetrievalError
+from app.grounding.validator import GroundingError, GroundingValidator
+from app.retrieval.schemas import ChunkReference, FusedChunk, SourcePassage
+
+FACT = "Services revenue increased 14% in fiscal 2025."
 
 
 def chunk() -> ChunkReference:
@@ -26,7 +26,7 @@ def chunk() -> ChunkReference:
         chunk_id=UUID("00000000-0000-0000-0000-000000000001"),
         document_id=uuid4(),
         chunk_index=1,
-        text="Services revenue increased.",
+        text=FACT,
         page_number=42,
         section="Results",
         ticker="AAPL",
@@ -39,20 +39,21 @@ def chunk() -> ChunkReference:
     )
 
 
-class FakeRetriever:
-    def __init__(self, passages=None):
-        self.filters = None
-        self.retrieve_calls = 0
-        self.passages = passages if passages is not None else [
-            SourcePassage(center={"chunk": chunk(), "rrf_score": 1.0})
-        ]
+def passages() -> list[SourcePassage]:
+    return [SourcePassage(center=FusedChunk(chunk=chunk(), rrf_score=1.0))]
 
-    async def retrieve(self, query: str, *, top_k: int = 5, filters=None, **kwargs):
-        assert query
-        assert top_k == 5
-        self.retrieve_calls += 1
-        self.filters = filters
-        return self.passages
+
+class FakeRetriever:
+    def __init__(self, result=None, error: Exception | None = None):
+        self.result = passages() if result is None else result
+        self.error = error
+        self.queries = []
+
+    async def retrieve(self, query, **kwargs):
+        self.queries.append(query)
+        if self.error is not None:
+            raise self.error
+        return self.result
 
     async def read_chunk(self, chunk_id):
         return chunk()
@@ -61,211 +62,225 @@ class FakeRetriever:
         return {"previous_chunks": [], "next_chunks": []}
 
 
-class FakeValidator:
-    def validate(self, answer, passages, *, evidence_candidates=None):
-        return answer
+class ScriptedModel:
+    """Each step is a function of the conversation so far that returns the reply."""
+
+    def __init__(self, *steps):
+        self.steps = list(steps)
+        self.calls: list[list] = []
+
+    async def ainvoke(self, messages):
+        self.calls.append(list(messages))
+        return self.steps.pop(0)(messages)
 
 
-def test_document_agent_has_production_model():
-    assert document_agent.model is not None
-
-
-def test_document_agent_returns_typed_output_and_exposes_search_tool():
-    evidence = candidate(chunk())
-    expected = {
-        "answer": "Services revenue increased.",
-        "citations": [
-            {
-                "evidence_id": str(evidence.evidence_id),
-            }
-        ],
-    }
-    retriever = FakeRetriever()
-    deps = DocumentAgentDeps(
-        user_id=uuid4(),
-        thread_id=uuid4(),
-        retriever=retriever,
-        grounding_validator=FakeValidator(),
-        retrieval_filters=RetrievalFilters(
-            tickers=("AAPL",),
-            filing_types=("10-K",),
-            fiscal_years=(2025,),
-        ),
+def call(name, args, call_id=None):
+    return AIMessage(
+        content="", tool_calls=[{"name": name, "args": args, "id": call_id or str(uuid4())}]
     )
-    deps.evidence_candidates[evidence.evidence_id] = evidence
-    deps.retrieval_completed = True
 
-    result = asyncio.run(
-        document_agent.run(
-            "Find Services revenue",
+
+def search(query="Services revenue"):
+    return lambda _messages: call("search_filings", {"query": query})
+
+
+def evidence_ids(messages) -> list[str]:
+    ids = []
+    for message in messages:
+        if isinstance(message, ToolMessage) and message.content.startswith("["):
+            ids += [item["evidence_id"] for item in json.loads(message.content)]
+    return ids
+
+
+def submit(answer=FACT, cite=True):
+    def step(messages):
+        citations = [{"evidence_id": evidence_ids(messages)[0]}] if cite else []
+        return call("submit_answer", {"answer": answer, "citations": citations})
+
+    return step
+
+
+def run(model, retriever=None, *, prefetched=None, limits=None, stages=None):
+    async def report(stage):
+        if stages is not None:
+            stages.append(stage)
+
+    deps = DocumentAgentDeps(
+        retriever=retriever or FakeRetriever(),
+        grounding_validator=GroundingValidator(),
+        on_stage=report,
+    )
+    return asyncio.run(
+        research(
+            "What happened to Services revenue?",
+            model=model,
             deps=deps,
-            model=TestModel(
-                call_tools=[],
-                custom_output_args=expected,
-            ),
+            prefetched=prefetched,
+            limits=limits,
         )
     )
 
-    assert isinstance(result.output, AgentAnswer)
-    assert isinstance(result.output.citations[0], CitationDraft)
 
-
-def test_agent_usage_limits_are_small_and_bound_tool_calls():
-    limits = agent_usage_limits()
-
-    assert limits.request_limit == 6
-    assert limits.tool_calls_limit == 8
-
-
-def test_retrieval_tools_remain_available_after_initial_search_for_deep_rag():
-    deps = agent_deps(FakeRetriever())
-    ctx = SimpleNamespace(deps=deps)
-    tool_definition = object()
-
-    assert prepare_retrieval_tool(ctx, tool_definition) is tool_definition
-
-    deps.retrieval_completed = True
-
-    assert prepare_retrieval_tool(ctx, tool_definition) is tool_definition
-
-
-def test_agent_instructions_keep_structured_citations_out_of_answer_text():
-    instructions = (Path(__file__).parents[2] / "app/assistant/instructions.md").read_text()
-
-    assert "Do not put chunk ids or citation notation in the answer text" in instructions
-    assert "Cite only evidence ids returned by the tools" in instructions
-    assert "Do not cite chunk ids" in instructions
-    assert "Do not reread a chunk that already has an evidence candidate" in instructions
-    assert "multiple distinct searches" in instructions
-    assert "comparisons, multi-part synthesis, or missing context" in instructions
-
-
-def test_search_filings_caches_identical_searches():
+def test_prefetched_search_lets_the_model_answer_in_one_request():
     retriever = FakeRetriever()
-    deps = agent_deps(retriever)
-    ctx = SimpleNamespace(deps=deps)
+    model = ScriptedModel(submit())
 
-    first = asyncio.run(search_filings(ctx, "Services revenue"))
-    second = asyncio.run(search_filings(ctx, "  services REVENUE  "))
+    answer = run(model, retriever, prefetched=passages())
 
-    assert first == second
-    assert retriever.retrieve_calls == 1
-    assert len(deps.retrieved_passages) == 1
-    assert first[0].evidence_id in deps.evidence_candidates
-    assert first[0].exact_quote == chunk().text
-    assert retriever.filters == RetrievalFilters(tickers=("AAPL",))
+    assert len(model.calls) == 1
+    assert retriever.queries == []
+    seeded = model.calls[0]
+    assert isinstance(seeded[0], SystemMessage) and seeded[0].content == INSTRUCTIONS
+    assert seeded[2].tool_calls[0]["id"] == PREFETCH_CALL_ID
+    assert seeded[3].tool_call_id == PREFETCH_CALL_ID
+    assert answer.answer == FACT
+    assert answer.citations[0].chunk_id == chunk().chunk_id
+    assert answer.citations[0].citation_label == "AAPL 10-K 2025"
 
 
-def test_search_filings_allows_distinct_follow_up_searches():
+def test_model_searches_then_submits_grounded_answer():
     retriever = FakeRetriever()
-    deps = agent_deps(retriever)
-    ctx = SimpleNamespace(deps=deps)
+    model = ScriptedModel(search(), submit())
+    stages = []
 
-    asyncio.run(search_filings(ctx, "Services revenue"))
-    asyncio.run(search_filings(ctx, "Product revenue"))
+    answer = run(model, retriever, stages=stages)
 
-    assert retriever.retrieve_calls == 2
-
-
-def test_surrounding_chunks_remain_readable_after_search():
-    deps = agent_deps(FakeRetriever())
-    ctx = SimpleNamespace(deps=deps)
-    asyncio.run(search_filings(ctx, "Services revenue"))
-
-    result = asyncio.run(read_surrounding_chunks(ctx, chunk().chunk_id))
-
-    assert result
+    assert retriever.queries == ["Services revenue"]
+    assert len(model.calls) == 2
+    assert answer.citations[0].quoted_text == FACT
+    assert stages == ["analyzing", "validating"]
 
 
-def test_read_chunk_reuses_evidence_id_registered_by_search():
-    deps = agent_deps(FakeRetriever())
-    ctx = SimpleNamespace(deps=deps)
-    searched = asyncio.run(search_filings(ctx, "Services revenue"))
-
-    reread = asyncio.run(read_chunk(ctx, chunk().chunk_id))
-
-    assert reread[0].evidence_id == searched[0].evidence_id
-    assert len(deps.evidence_candidates) == 1
-
-
-def test_search_filings_returns_terminal_message_when_no_passages_match():
-    deps = agent_deps(FakeRetriever(passages=[]))
-
-    result = asyncio.run(search_filings(SimpleNamespace(deps=deps), "No match"))
-
-    assert result == "No matching filing passages were found. Stop searching and report insufficient evidence."
-
-
-def test_read_chunk_registers_chunk_as_trusted_evidence():
-    deps = agent_deps(FakeRetriever())
-    deps.evidence_query = "Services revenue"
-    retrieved = asyncio.run(read_chunk(SimpleNamespace(deps=deps), chunk().chunk_id))
-    answer = AgentAnswer(
-        answer="Services revenue increased.",
-        citations=[CitationDraft(evidence_id=retrieved[0].evidence_id)],
+def test_rejected_answer_is_returned_to_the_model_once_to_fix():
+    model = ScriptedModel(
+        search(),
+        submit(answer="Services revenue increased 41% in fiscal 2025."),
+        submit(),
     )
 
-    validated = GroundingValidator().validate(
-        answer,
-        deps.retrieved_passages,
-        evidence_candidates=deps.evidence_candidates,
+    answer = run(model)
+
+    feedback = model.calls[2][-1]
+    assert isinstance(feedback, ToolMessage)
+    assert feedback.content.startswith("Answer rejected")
+    assert answer.answer == FACT
+
+
+def test_second_grounding_failure_fails_the_turn():
+    bad = "Services revenue increased 41% in fiscal 2025."
+    model = ScriptedModel(search(), submit(answer=bad), submit(answer=bad))
+
+    with pytest.raises(GroundingError):
+        run(model)
+
+
+def test_uncited_factual_answer_is_rejected():
+    model = ScriptedModel(search(), submit(cite=False), submit(cite=False))
+
+    with pytest.raises(GroundingError):
+        run(model)
+
+
+def test_insufficient_evidence_answer_needs_no_citation():
+    model = ScriptedModel(
+        search(),
+        submit(answer="The corpus does not contain enough evidence.", cite=False),
     )
 
-    assert retrieved[0].chunk_id == chunk().chunk_id
-    assert validated.citations[0].citation_label == "AAPL 10-K 2025"
+    answer = run(model)
+
+    assert answer.citations == []
 
 
-def test_read_surrounding_chunks_registers_neighbors_as_trusted_evidence():
-    deps = agent_deps(FakeRetriever())
-    neighbor = chunk().model_copy(
-        update={"chunk_id": UUID("00000000-0000-0000-0000-000000000002"), "text": "Neighbor evidence."}
-    )
+def test_request_limit_stops_a_model_that_never_submits():
+    model = ScriptedModel(*(search(f"query {n}") for n in range(10)))
 
-    async def surrounding(chunk_id, *, window=1):
-        return {"previous_chunks": [neighbor], "next_chunks": []}
+    with pytest.raises(ResearchLimitExceeded):
+        run(model, limits=ResearchLimits(request_limit=3, tool_calls_limit=20))
 
-    deps.retriever.read_surrounding_chunks = surrounding
-    deps.evidence_query = "Neighbor evidence"
-    result = asyncio.run(
-        read_surrounding_chunks(SimpleNamespace(deps=deps), chunk().chunk_id, window=1)
-    )
-    answer = AgentAnswer(
-        answer="Neighbor evidence.",
-        citations=[
-            CitationDraft(
-                evidence_id=next(
-                    candidate.evidence_id
-                    for candidate in result
-                    if candidate.chunk_id == neighbor.chunk_id
-                )
-            )
+    assert len(model.calls) == 3
+
+
+def test_tool_call_limit_counts_every_evidence_call():
+    many = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "search_filings", "args": {"query": f"q{n}"}, "id": f"c{n}"}
+            for n in range(5)
         ],
     )
+    model = ScriptedModel(lambda _m: many)
 
-    validated = GroundingValidator().validate(
-        answer,
-        deps.retrieved_passages,
-        evidence_candidates=deps.evidence_candidates,
+    with pytest.raises(ResearchLimitExceeded):
+        run(model, limits=ResearchLimits(tool_calls_limit=4))
+
+
+def test_text_reply_without_tool_call_fails_closed():
+    model = ScriptedModel(lambda _m: AIMessage(content="Services revenue went up."))
+
+    with pytest.raises(ResearchLimitExceeded):
+        run(model)
+
+
+def test_invalid_tool_arguments_are_reported_back_not_raised():
+    model = ScriptedModel(
+        lambda _m: call("search_filings", {"query": ""}),
+        search(),
+        submit(),
     )
 
-    assert any(candidate.chunk_id == neighbor.chunk_id for candidate in result)
-    assert validated.citations[0].chunk_id == neighbor.chunk_id
+    answer = run(model)
+
+    error = model.calls[1][-1]
+    assert isinstance(error, ToolMessage) and error.content.startswith("Invalid arguments")
+    assert answer.answer == FACT
 
 
-def agent_deps(retriever: FakeRetriever) -> DocumentAgentDeps:
-    return DocumentAgentDeps(
-        user_id=uuid4(),
-        thread_id=uuid4(),
-        retriever=retriever,
-        grounding_validator=GroundingValidator(),
-        retrieval_filters=RetrievalFilters(tickers=("AAPL",)),
+def test_unknown_tool_is_reported_back():
+    model = ScriptedModel(lambda _m: call("delete_everything", {}), search(), submit())
+
+    run(model)
+
+    assert model.calls[1][-1].content == "Unknown tool delete_everything."
+
+
+def test_parallel_tool_calls_each_get_a_tool_message():
+    both = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "search_filings", "args": {"query": "Services"}, "id": "a"},
+            {"name": "read_chunk", "args": {"chunk_id": str(chunk().chunk_id)}, "id": "b"},
+        ],
     )
+    model = ScriptedModel(lambda _m: both, submit())
+
+    run(model)
+
+    replies = [m for m in model.calls[1] if isinstance(m, ToolMessage)]
+    assert {m.tool_call_id for m in replies} == {"a", "b"}
 
 
-def candidate(value: ChunkReference) -> EvidenceCandidate:
-    return EvidenceCandidate(
-        chunk_id=value.chunk_id,
-        exact_quote=value.text,
-        citation_label=value.citation_label,
-        location_label=value.location_label,
+def test_retrieval_failure_inside_the_loop_is_typed():
+    model = ScriptedModel(search())
+
+    with pytest.raises(RetrievalError):
+        run(model, FakeRetriever(error=RuntimeError("pgvector down")))
+
+
+def test_reused_reply_object_still_hits_the_request_limit():
+    """add_messages merges replies that share an id; the loop must still terminate."""
+    same = call("search_filings", {"query": "x"}, call_id="same")
+    model = ScriptedModel(*([lambda _m: same] * 10))
+
+    with pytest.raises(ResearchLimitExceeded):
+        run(model, limits=ResearchLimits(request_limit=4, tool_calls_limit=20))
+
+
+def test_model_can_only_cite_evidence_registered_this_run():
+    forged = lambda _m: call(
+        "submit_answer", {"answer": FACT, "citations": [{"evidence_id": str(uuid4())}]}
     )
+    model = ScriptedModel(search(), forged, forged)
+
+    with pytest.raises(GroundingError):
+        run(model)

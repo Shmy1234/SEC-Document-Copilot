@@ -1,6 +1,6 @@
 from urllib.parse import urlparse
 
-from pydantic import computed_field, field_validator
+from pydantic import computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     OPENAI_EMBEDDING_DIMENSIONS: int = 1536
     ALLOWED_ORIGINS: str = "http://localhost:5173"
+    # LangSmith reads these from os.environ itself; they are mirrored here and the
+    # tracer is built explicitly from them so .env values are honoured.
+    LANGSMITH_TRACING: bool = False
+    LANGSMITH_API_KEY: str | None = None
+    LANGSMITH_PROJECT: str = "document-copilot"
+    LANGSMITH_ENDPOINT: str = "https://api.smith.langchain.com"
 
     @field_validator(
         "SUPABASE_URL",
@@ -69,6 +75,12 @@ class Settings(BaseSettings):
         if value <= 0:
             raise ValueError("must be positive")
         return value
+
+    @model_validator(mode="after")
+    def require_langsmith_key_when_tracing(self) -> "Settings":
+        if self.LANGSMITH_TRACING and not (self.LANGSMITH_API_KEY or "").strip():
+            raise ValueError("LANGSMITH_API_KEY is required when LANGSMITH_TRACING is true")
+        return self
 
     @computed_field
     @property

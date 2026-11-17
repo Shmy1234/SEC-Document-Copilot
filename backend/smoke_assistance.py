@@ -5,13 +5,17 @@ import asyncio
 import json
 from dataclasses import asdict, dataclass
 from time import perf_counter
-from uuid import uuid4
 
-from app.assistant.agent import agent_usage_limits, document_agent
+from langchain_core.messages import AIMessage, AnyMessage
+from langchain_core.runnables import Runnable
+from openai import AsyncOpenAI
+
+from app.assistant.agent import research
 from app.assistant.deps import DocumentAgentDeps
-from app.chat.orchestrator import AgentRunner
+from app.assistant.models import build_chat_models
 from app.config import settings
 from app.grounding.validator import GroundingValidator
+from app.retrieval.embeddings import OpenAIQueryEmbedder
 from app.retrieval.retriever import DocumentRetriever
 from app.retrieval.schemas import RetrievalFilters
 from ingest.repository import create_sessionmaker
@@ -133,11 +137,14 @@ def format_answer(answer) -> str:
 async def run_query(
     case: SmokeCase = SMOKE_CASES[0],
     *,
-    agent_runner: AgentRunner | None = None,
+    research_model: Runnable[list[AnyMessage], AIMessage] | None = None,
     retriever: DocumentRetriever | None = None,
 ) -> SmokeResult:
-    runner = agent_runner or document_agent
-    active_retriever = retriever or DocumentRetriever(session_factory=create_sessionmaker())
+    model = research_model or build_chat_models(settings).research
+    active_retriever = retriever or DocumentRetriever(
+        session_factory=create_sessionmaker(),
+        embedder=OpenAIQueryEmbedder(AsyncOpenAI(api_key=settings.OPENAI_API_KEY)),
+    )
     validator = GroundingValidator()
     started = perf_counter()
     first_stage_seconds: float | None = None
@@ -148,23 +155,14 @@ async def run_query(
             first_stage_seconds = perf_counter() - started
 
     deps = DocumentAgentDeps(
-        user_id=uuid4(),
-        thread_id=uuid4(),
         retriever=active_retriever,
         grounding_validator=validator,
         retrieval_filters=case.filters,
         on_stage=record_stage,
     )
-    result = await runner.run(
-        case.question,
-        deps=deps,
-        usage_limits=agent_usage_limits(),
-    )
-    answer = validator.validate(
-        result.output,
-        deps.retrieved_passages,
-        evidence_candidates=deps.evidence_candidates,
-    )
+    # No prefetch: the brief's questions carry filters, so the research loop
+    # issues its own filtered searches.
+    answer = await research(case.question, model=model, deps=deps)
     citations = [citation.model_dump(mode="json") for citation in answer.citations]
     return SmokeResult(
         key=case.key,

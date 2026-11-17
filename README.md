@@ -155,7 +155,7 @@ flowchart TB
 | Backend | Python 3.12, FastAPI, Uvicorn, Pydantic v2 |
 | Database | Supabase Postgres, SQLAlchemy models, Alembic migrations |
 | Retrieval | `pgvector`, Postgres full-text search, Reciprocal Rank Fusion |
-| AI | OpenAI SDK, OpenAI embeddings, PydanticAI target orchestration |
+| AI | OpenAI embeddings, LangChain + LangGraph orchestration, LangSmith tracing |
 | Package management | `uv` for backend, `pnpm` for frontend |
 | Hosting target | Railway frontend service + Railway backend service + hosted Supabase |
 
@@ -303,10 +303,14 @@ Backend environment variables:
 | `SUPABASE_SERVICE_ROLE_KEY` | Backend-only privileged Supabase key |
 | `DATABASE_URL` | Direct Supabase Postgres connection string for Alembic/app DB access |
 | `OPENAI_API_KEY` | OpenAI API key for embeddings and generation |
-| `OPENAI_CHAT_MODEL` | PydanticAI chat model identifier, for example `openai:gpt-5-mini` |
+| `OPENAI_CHAT_MODEL` | Deep-research chat model, for example `openai:gpt-5-mini` |
+| `OPENAI_FAST_MODEL` | Routing and quick-answer model, for example `openai:gpt-5-mini` |
 | `OPENAI_EMBEDDING_MODEL` | Embedding model, default `text-embedding-3-small` |
 | `OPENAI_EMBEDDING_DIMENSIONS` | Embedding dimension count, default `1536` |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins |
+| `LANGSMITH_TRACING` | `true` to send a LangSmith trace per chat turn (default `false`) |
+| `LANGSMITH_API_KEY` | Required when tracing is on |
+| `LANGSMITH_PROJECT` | LangSmith project name, default `document-copilot` |
 
 ### 2. Configure the frontend
 

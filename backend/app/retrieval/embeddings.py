@@ -11,8 +11,8 @@ class QueryEmbedder(Protocol):
 
 
 class OpenAIQueryEmbedder:
-    def __init__(self, client: AsyncOpenAI | None = None) -> None:
-        self._client = client or AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    def __init__(self, client: AsyncOpenAI) -> None:
+        self._client = client
 
     async def embed_query(self, query: str) -> list[float]:
         normalized = query.strip()

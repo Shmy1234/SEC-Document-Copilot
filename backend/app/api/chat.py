@@ -1,15 +1,11 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
-from app.assistant.agent import document_agent
-from app.assistant.deps import StageCallback
 from app.auth.dependencies import AuthenticatedUser, get_current_user
-from app.chat.orchestrator import run_chat_turn
-from app.chat.quick_rag import QuickRagRunner
-from app.chat.routing import ChatRouter
+from app.chat.graph import TurnContext
 from app.chat.schemas import (
     ChatMessageResponse,
     ChatThreadResponse,
@@ -20,46 +16,62 @@ from app.chat.schemas import (
     UpdateThreadRequest,
 )
 from app.chat.streaming import stream_chat_turn
+from app.chat.turn import ChatTurn
 from app.database.chats import ChatStore, ForbiddenThreadError, ThreadNotFoundError
-from app.database.supabase import create_service_role_client
 from app.grounding.validator import GroundingValidator
+from app.resources import Resources
+from app.retrieval.embeddings import OpenAIQueryEmbedder
 from app.retrieval.retriever import DocumentRetriever
-from ingest.repository import create_sessionmaker
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 
-def get_chat_store() -> ChatStore:
-    return ChatStore(create_service_role_client())
+def get_resources(request: Request) -> Resources:
+    return request.app.state.resources
 
 
-def get_document_retriever() -> DocumentRetriever:
-    return DocumentRetriever(session_factory=create_sessionmaker())
+ResourcesDependency = Annotated[Resources, Depends(get_resources)]
 
 
-def get_agent_runner():
-    return document_agent
+def get_chat_store(resources: ResourcesDependency) -> ChatStore:
+    return ChatStore(resources.supabase)
+
+
+def get_document_retriever(resources: ResourcesDependency) -> DocumentRetriever:
+    return DocumentRetriever(
+        session_factory=resources.session_factory,
+        embedder=OpenAIQueryEmbedder(resources.openai),
+    )
 
 
 def get_grounding_validator() -> GroundingValidator:
     return GroundingValidator()
 
 
-def get_chat_router() -> ChatRouter:
-    return ChatRouter()
+ChatStoreDependency = Annotated[ChatStore, Depends(get_chat_store)]
+RetrieverDependency = Annotated[DocumentRetriever, Depends(get_document_retriever)]
+GroundingDependency = Annotated[GroundingValidator, Depends(get_grounding_validator)]
 
 
-def get_quick_rag_runner() -> QuickRagRunner:
-    return QuickRagRunner()
+def get_chat_turn(
+    resources: ResourcesDependency,
+    store: ChatStoreDependency,
+    retriever: RetrieverDependency,
+    grounding_validator: GroundingDependency,
+) -> ChatTurn:
+    return ChatTurn(
+        store=store,
+        context=TurnContext(
+            models=resources.models,
+            retriever=retriever,
+            grounding_validator=grounding_validator,
+        ),
+        callbacks=resources.callbacks,
+    )
 
 
 CurrentUser = Annotated[AuthenticatedUser, Depends(get_current_user)]
-ChatStoreDependency = Annotated[ChatStore, Depends(get_chat_store)]
-RetrieverDependency = Annotated[DocumentRetriever, Depends(get_document_retriever)]
-AgentDependency = Annotated[object, Depends(get_agent_runner)]
-GroundingDependency = Annotated[GroundingValidator, Depends(get_grounding_validator)]
-RouterDependency = Annotated[ChatRouter, Depends(get_chat_router)]
-QuickRagDependency = Annotated[QuickRagRunner, Depends(get_quick_rag_runner)]
+ChatTurnDependency = Annotated[ChatTurn, Depends(get_chat_turn)]
 
 
 def map_thread_error(error: Exception) -> HTTPException:
@@ -190,12 +202,13 @@ async def get_citation_source(
 
 
 def latest_user_text(messages: list[UIMessage]) -> str:
-    for message in reversed(messages):
-        if message.role != "user":
-            continue
-        if message.content and message.content.strip():
-            return message.content
-        part_text = "".join(part.text or "" for part in message.parts if part.type == "text")
+    # Only the newest user message is the question. Falling back to an earlier
+    # one would silently re-ask a previous question when the new one is blank.
+    latest = next((message for message in reversed(messages) if message.role == "user"), None)
+    if latest is not None:
+        if latest.content and latest.content.strip():
+            return latest.content
+        part_text = "".join(part.text or "" for part in latest.parts if part.type == "text")
         if part_text.strip():
             return part_text
     raise HTTPException(
@@ -209,11 +222,7 @@ async def stream_chat(
     request: StreamChatRequest,
     user: CurrentUser,
     store: ChatStoreDependency,
-    retriever: RetrieverDependency,
-    agent_runner: AgentDependency,
-    grounding_validator: GroundingDependency,
-    chat_router: RouterDependency,
-    quick_rag_runner: QuickRagDependency,
+    turn: ChatTurnDependency,
 ) -> StreamingResponse:
     try:
         await store.get_thread(user.id, request.thread_id)
@@ -222,27 +231,11 @@ async def stream_chat(
 
     user_text = latest_user_text(request.messages)
 
-    async def run_turn(on_stage: StageCallback, on_answer_ready, on_route):
-        return await run_chat_turn(
-            user_id=user.id,
-            thread_id=request.thread_id,
-            user_text=user_text,
-            store=store,
-            router=chat_router,
-            quick_rag_runner=quick_rag_runner,
-            agent_runner=agent_runner,
-            retriever=retriever,
-            grounding_validator=grounding_validator,
-            on_stage=on_stage,
-            on_answer_ready=on_answer_ready,
-            on_route=on_route,
-        )
-
     # Auth and ownership already failed as HTTP above. Everything from here runs
     # inside the stream so the client sees real stage progress, and failures
     # arrive as typed data-error parts rather than a dead connection.
     return StreamingResponse(
-        stream_chat_turn(run_turn),
+        stream_chat_turn(turn.run(thread_id=request.thread_id, question=user_text)),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

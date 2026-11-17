@@ -1,7 +1,6 @@
 import json
-from types import SimpleNamespace
 
-from app.assistant.outputs import AgentAnswer, GroundedAnswer
+from app.assistant.outputs import GroundedAnswer
 from app.config import settings
 from smoke_assistance import SMOKE_CASES, format_answer, run_query
 
@@ -37,30 +36,36 @@ def test_format_answer_excludes_full_retrieved_passages():
     assert rendered == {"answer": "No evidence.", "citations": []}
 
 
-def test_run_query_records_grounded_result_and_latency_without_model_override():
-    class FakeAgent:
-        def __init__(self):
-            self.kwargs = None
+def test_run_query_records_grounded_result_and_latency():
+    from langchain_core.messages import AIMessage
+    from langchain_core.runnables import RunnableLambda
 
-        async def run(self, prompt, **kwargs):
-            self.kwargs = kwargs
-            return SimpleNamespace(
-                output=AgentAnswer(answer="Insufficient evidence in the available filings.")
-            )
+    seen = []
 
-    fake_agent = FakeAgent()
+    async def submit(messages):
+        seen.append(messages)
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "submit_answer",
+                    "args": {"answer": "Insufficient evidence in the available filings."},
+                    "id": "call-1",
+                }
+            ],
+        )
 
     import asyncio
 
     result = asyncio.run(
         run_query(
             SMOKE_CASES[0],
-            agent_runner=fake_agent,
+            research_model=RunnableLambda(submit),
             retriever=object(),
         )
     )
 
-    assert "model" not in fake_agent.kwargs
+    assert len(seen) == 1
     assert result.key == "apple_revenue_mix"
     assert result.question == SMOKE_CASES[0].question
     assert result.requires_refusal is False

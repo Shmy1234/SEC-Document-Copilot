@@ -11,7 +11,8 @@ This is the FastAPI service for Document Copilot. Read [../AGENTS.md](../AGENTS.
 - `pytest` for tests
 - Supabase Python client (DB + auth)
 - SQLAlchemy models + Alembic migrations for database schema changes
-- OpenAI SDK for LLM & embeddings
+- OpenAI SDK for embeddings; LangChain (`langchain-openai`) for chat models
+- LangGraph for the chat turn graph and research tool loop; LangSmith for optional tracing
 - Supabase `pgvector` for semantic search and Postgres full-text search for keyword retrieval. Hybrid search should run vector and full-text queries separately, then fuse ranked results in Python with Reciprocal Rank Fusion.
 - `structlog` for logging
 - `uv` for dependency + project management
@@ -33,12 +34,13 @@ backend/
 │   └── versions/        # Reviewed migration files
 ├── alembic.ini
 ├── app/
-│   ├── main.py          # FastAPI entrypoint
+│   ├── main.py          # FastAPI entrypoint; lifespan builds Resources
+│   ├── resources.py     # process-lifetime clients (DB, OpenAI, Supabase, models, tracer)
 │   ├── config.py        # Pydantic settings — single source of truth for env
 │   ├── api/             # FastAPI routers (chat, ingest, auth)
 │   ├── auth/            # Supabase JWT verification + current user dependency
-│   ├── chat/            # turn orchestration, AI SDK message conversion, streaming
-│   ├── assistant/       # PydanticAI agent, deps, outputs, instructions
+│   ├── chat/            # ChatTurn, LangGraph turn graph, routing, streaming
+│   ├── assistant/       # chat models, research loop, tools, outputs, instructions
 │   ├── retrieval/       # pgvector/full-text queries, RRF fusion, source passage lookup
 │   ├── grounding/       # citation validation and answer grounding checks
 │   ├── database/        # SQLAlchemy models, Supabase client wrapper, typed query helpers
@@ -83,5 +85,6 @@ backend/
 - Wrapping FastAPI responses in custom envelope classes.
 - Over-catching `Exception` just to log and re-raise; let it propagate.
 - Shared state through globals instead of FastAPI `app.state` or DI.
+- Building clients, engines or models per request — they live in `Resources`, built once in the lifespan.
 - Silent fallbacks that hide real config errors.
 - Mocking the LLM in unit tests without also testing the grounding contract — the prompt is the product.

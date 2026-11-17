@@ -5,20 +5,16 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi import status
 from httpx import ASGITransport, AsyncClient
-from pydantic_ai.exceptions import UsageLimitExceeded
+from langchain_core.messages import AIMessage
 
 from app.api.chat import (
-    get_agent_runner,
-    get_chat_router,
     get_chat_store,
     get_document_retriever,
-    get_grounding_validator,
-    get_quick_rag_runner,
+    get_resources,
 )
-from app.assistant.outputs import GroundedAnswer
+from app.assistant.models import ChatModels
 from app.auth.dependencies import AuthenticatedUser, get_current_user
-from app.chat.routing import RouteDecision
-from app.chat.stub_stream import build_stub_reply
+from app.chat.routing import ModelRouteDecision
 from app.database.chats import ForbiddenThreadError, ThreadNotFoundError
 from app.main import app
 
@@ -95,42 +91,41 @@ class MemoryChatStore:
 
 
 class FakeRetriever:
+    def __init__(self):
+        self.calls = 0
+
     async def retrieve(self, query: str, **kwargs):
+        self.calls += 1
         return []
 
 
-class FakeAgent:
-    async def run(self, prompt: str, *, deps, usage_limits):
-        return SimpleNamespace(output=GroundedAnswer(answer=build_stub_reply(prompt)))
-
-
-class ExhaustedAgent:
-    async def run(self, prompt: str, *, deps, usage_limits):
-        raise UsageLimitExceeded("request limit reached")
-
-
-class FakeGroundingValidator:
-    def validate(self, answer, passages, *, evidence_candidates=None):
-        return answer
-
-
-class FakeRouter:
-    def __init__(self, decision: RouteDecision):
-        self.decision = decision
-
-    async def route(self, prompt: str):
-        return self.decision
-
-
-class FakeQuickRagRunner:
-    def __init__(self, answer: GroundedAnswer | None = None):
-        self.answer = answer or GroundedAnswer(answer="The corpus does not contain enough evidence.")
+class Scripted:
+    def __init__(self, *replies):
+        self.replies = list(replies)
         self.calls = 0
 
-    async def run(self, prompt, *, retriever, grounding_validator, on_stage):
+    async def ainvoke(self, messages):
         self.calls += 1
-        await on_stage("searching")
-        return self.answer
+        return self.replies.pop(0)
+
+
+def runaway_research() -> Scripted:
+    search = AIMessage(
+        content="",
+        tool_calls=[{"name": "search_filings", "args": {"query": "x"}, "id": "x"}],
+    )
+    return Scripted(*([search] * 20))
+
+
+def use_models(route: ModelRouteDecision | None, *, quick=(), research=None) -> ChatModels:
+    models = ChatModels(
+        route=Scripted(*([route] if route else [])),
+        quick_answer=Scripted(*quick),
+        research=research or Scripted(),
+    )
+    resources = SimpleNamespace(models=models, callbacks=[])
+    app.dependency_overrides[get_resources] = lambda: resources
+    return models
 
 
 @pytest.fixture
@@ -217,19 +212,14 @@ async def test_delete_missing_thread_returns_not_found(user, store):
 
 
 @pytest.mark.anyio
-async def test_stream_persists_messages_and_returns_stub(user, store):
+async def test_stream_persists_messages_and_streams_the_answer(user, store):
     async def override_user():
         return user
 
     app.dependency_overrides[get_current_user] = override_user
     app.dependency_overrides[get_chat_store] = lambda: store
     app.dependency_overrides[get_document_retriever] = lambda: FakeRetriever()
-    app.dependency_overrides[get_agent_runner] = lambda: FakeAgent()
-    app.dependency_overrides[get_grounding_validator] = lambda: FakeGroundingValidator()
-    app.dependency_overrides[get_chat_router] = lambda: FakeRouter(
-        RouteDecision(route="direct", answer=build_stub_reply("What changed?"))
-    )
-    app.dependency_overrides[get_quick_rag_runner] = lambda: FakeQuickRagRunner()
+    use_models(ModelRouteDecision(route="direct", answer="I explain how to use this workspace."))
     await store.create_thread(user.id, "Apple revenue mix")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -242,9 +232,11 @@ async def test_stream_persists_messages_and_returns_stub(user, store):
         )
 
     assert response.status_code == status.HTTP_200_OK
-    assert '"type": "text-delta"' in response.text
-    assert '"type": "finish"' in response.text
+    assert '"delta": "I explain how to use this workspace."' in response.text
+    assert '"data": {"route": "direct"}' in response.text
+    assert '"finishReason": "stop"' in response.text
     assert [message["role"] for message in store.messages] == ["user", "assistant"]
+    assert store.messages[1]["message_data"]["route"] == "direct"
 
 
 @pytest.mark.anyio
@@ -252,16 +244,11 @@ async def test_stream_can_select_quick_rag_without_running_deep_agent(user, stor
     async def override_user():
         return user
 
-    quick = FakeQuickRagRunner()
+    retriever = FakeRetriever()
     app.dependency_overrides[get_current_user] = override_user
     app.dependency_overrides[get_chat_store] = lambda: store
-    app.dependency_overrides[get_document_retriever] = lambda: FakeRetriever()
-    app.dependency_overrides[get_agent_runner] = lambda: ExhaustedAgent()
-    app.dependency_overrides[get_grounding_validator] = lambda: FakeGroundingValidator()
-    app.dependency_overrides[get_chat_router] = lambda: FakeRouter(
-        RouteDecision(route="quick_rag")
-    )
-    app.dependency_overrides[get_quick_rag_runner] = lambda: quick
+    app.dependency_overrides[get_document_retriever] = lambda: retriever
+    models = use_models(ModelRouteDecision(route="quick_rag"), research=runaway_research())
     await store.create_thread(user.id, "Apple revenue mix")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -274,9 +261,12 @@ async def test_stream_can_select_quick_rag_without_running_deep_agent(user, stor
         )
 
     assert response.status_code == status.HTTP_200_OK
-    assert quick.calls == 1
+    assert retriever.calls == 1
+    assert models.research.calls == 0
     assert '"stage": "routing"' in response.text
     assert '"stage": "searching"' in response.text
+    # No passages matched, so the answer is the explicit no-evidence reply.
+    assert "does not contain enough evidence" in response.text
 
 
 @pytest.mark.anyio
@@ -300,8 +290,7 @@ async def test_stream_rejects_missing_or_blank_user_text_before_orchestration(
     app.dependency_overrides[get_current_user] = override_user
     app.dependency_overrides[get_chat_store] = lambda: store
     app.dependency_overrides[get_document_retriever] = lambda: FakeRetriever()
-    app.dependency_overrides[get_agent_runner] = lambda: FakeAgent()
-    app.dependency_overrides[get_grounding_validator] = lambda: FakeGroundingValidator()
+    models = use_models(None)
     await store.create_thread(user.id, "Apple revenue mix")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -313,6 +302,7 @@ async def test_stream_rejects_missing_or_blank_user_text_before_orchestration(
     assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
     assert response.json() == {"detail": "A non-blank user message is required"}
     assert store.messages == []
+    assert models.route.calls == 0
 
 
 @pytest.mark.anyio
@@ -323,12 +313,7 @@ async def test_stream_returns_controlled_error_when_agent_exhausts_budget(user, 
     app.dependency_overrides[get_current_user] = override_user
     app.dependency_overrides[get_chat_store] = lambda: store
     app.dependency_overrides[get_document_retriever] = lambda: FakeRetriever()
-    app.dependency_overrides[get_agent_runner] = lambda: ExhaustedAgent()
-    app.dependency_overrides[get_grounding_validator] = lambda: FakeGroundingValidator()
-    app.dependency_overrides[get_chat_router] = lambda: FakeRouter(
-        RouteDecision(route="deep_rag")
-    )
-    app.dependency_overrides[get_quick_rag_runner] = lambda: FakeQuickRagRunner()
+    use_models(ModelRouteDecision(route="deep_rag"), research=runaway_research())
     await store.create_thread(user.id, "Apple revenue mix")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -346,7 +331,8 @@ async def test_stream_returns_controlled_error_when_agent_exhausts_budget(user, 
     assert '"type": "data-error"' in response.text
     assert '"code": "processing_failed"' in response.text
     assert '"type": "text-delta"' not in response.text
-    assert "UsageLimitExceeded" not in response.text
+    assert "ResearchLimitExceeded" not in response.text
+    assert store.messages[-1]["message_data"]["error_code"] == "processing_failed"
 
 
 @pytest.mark.anyio

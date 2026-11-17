@@ -5,9 +5,12 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from openai import AsyncOpenAI
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from app.config import settings
+from app.retrieval.embeddings import OpenAIQueryEmbedder
 from app.retrieval.retriever import DocumentRetriever
 from app.retrieval.schemas import RetrievalFilters
 from ingest.repository import create_sessionmaker
@@ -113,7 +116,10 @@ def test_atomic_chat_functions_serialize_positions_and_roll_back_bad_citations()
     ),
 )
 def test_live_hybrid_retrieval_meets_smoke_expectations(case):
-    retriever = DocumentRetriever(session_factory=create_sessionmaker())
+    retriever = DocumentRetriever(
+        session_factory=create_sessionmaker(),
+        embedder=OpenAIQueryEmbedder(AsyncOpenAI(api_key=settings.OPENAI_API_KEY)),
+    )
     passages = asyncio.run(
         retriever.retrieve(
             case["query"],

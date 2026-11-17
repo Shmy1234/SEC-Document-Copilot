@@ -5,7 +5,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.retrieval.embeddings import OpenAIQueryEmbedder, QueryEmbedder
+from app.retrieval.embeddings import QueryEmbedder
 from app.retrieval.fusion import reciprocal_rank_fusion
 from app.retrieval.queries import (
     full_text_search,
@@ -21,10 +21,10 @@ class DocumentRetriever:
         self,
         *,
         session_factory: Callable[[], AbstractContextManager[Session]],
-        embedder: QueryEmbedder | None = None,
+        embedder: QueryEmbedder,
     ) -> None:
         self._session_factory = session_factory
-        self._embedder = embedder or OpenAIQueryEmbedder()
+        self._embedder = embedder
 
     async def retrieve(
         self,

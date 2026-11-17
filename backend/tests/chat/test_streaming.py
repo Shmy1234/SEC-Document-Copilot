@@ -3,75 +3,74 @@ import json
 
 from app.assistant.outputs import GroundedAnswer
 from app.chat.stages import RetrievalError
-from app.chat.streaming import stream_chat_turn, stream_grounded_answer
+from app.chat.streaming import stream_chat_turn
+from app.chat.turn import AnswerEvent, RouteEvent, StageEvent
 from app.grounding.validator import GroundingError
 
-
-def test_stream_grounded_answer_emits_text_citations_and_finish_records():
-    answer = GroundedAnswer(answer="Services revenue increased.")
-
-    async def collect():
-        return [part async for part in stream_grounded_answer(answer, chunk_size=10)]
-
-    parts = asyncio.run(collect())
-
-    assert parts[0] == 'data: {"type": "start", "messageId": "assistant-message"}\n\n'
-    assert '"type": "text-delta"' in parts[2]
-    assert '"type": "data-citations"' in parts[-2]
-    assert parts[-1] == 'data: {"type": "finish", "finishReason": "stop"}\n\n'
+FINISH_STOP = 'data: {"type": "finish", "finishReason": "stop"}\n\n'
+FINISH_ERROR = 'data: {"type": "finish", "finishReason": "error"}\n\n'
 
 
-def collect_turn(run_turn) -> list[str]:
-    async def collect():
-        return [part async for part in stream_chat_turn(run_turn, chunk_size=10)]
+async def scripted(*events, error: Exception | None = None):
+    for event in events:
+        yield event
+    if error is not None:
+        raise error
 
-    return asyncio.run(collect())
+
+def collect(events) -> list[str]:
+    async def run():
+        return [part async for part in stream_chat_turn(events, chunk_size=10)]
+
+    return asyncio.run(run())
+
+
+def payloads(parts: list[str]) -> list[dict]:
+    return [json.loads(part.removeprefix("data: ").strip()) for part in parts]
 
 
 def stages_in(parts: list[str]) -> list[str]:
-    stages = []
-    for part in parts:
-        payload = json.loads(part.removeprefix("data: ").strip())
-        if payload["type"] == "data-status":
-            stages.append(payload["data"]["stage"])
-    return stages
+    return [p["data"]["stage"] for p in payloads(parts) if p["type"] == "data-status"]
 
 
-def test_stream_chat_turn_emits_stages_in_order_before_the_answer():
-    async def run_turn(on_stage, on_answer_ready, on_route):
-        await on_stage("routing")
-        await on_stage("searching")
-        await on_stage("analyzing")
-        await on_stage("validating")
-        await on_stage("saving")
-        return GroundedAnswer(answer="Services revenue increased.")
+def test_answer_is_chunked_into_text_deltas_followed_by_citations_and_finish():
+    answer = GroundedAnswer(answer="Services revenue increased.")
 
-    parts = collect_turn(run_turn)
+    parts = collect(scripted(AnswerEvent(answer)))
+    kinds = [p["type"] for p in payloads(parts)]
 
-    assert stages_in(parts) == ["routing", "searching", "analyzing", "validating", "saving"]
-    last_status = max(index for index, part in enumerate(parts) if '"data-status"' in part)
-    first_delta = min(index for index, part in enumerate(parts) if '"text-delta"' in part)
+    assert parts[0] == 'data: {"type": "start", "messageId": "assistant-message"}\n\n'
+    assert kinds[1] == "text-start"
+    deltas = [p["delta"] for p in payloads(parts) if p["type"] == "text-delta"]
+    assert "".join(deltas) == answer.answer
+    assert all(len(delta) <= 10 for delta in deltas)
+    assert kinds[-3:] == ["text-end", "data-citations", "finish"]
+    assert parts[-1] == FINISH_STOP
+
+
+def test_stages_stream_in_order_before_the_answer():
+    stages = ["routing", "searching", "analyzing", "validating", "saving"]
+    parts = collect(
+        scripted(*(StageEvent(s) for s in stages), AnswerEvent(GroundedAnswer(answer="Done.")))
+    )
+
+    assert stages_in(parts) == stages
+    last_status = max(i for i, part in enumerate(parts) if '"data-status"' in part)
+    first_delta = min(i for i, part in enumerate(parts) if '"text-delta"' in part)
     assert last_status < first_delta
-    assert parts[-1] == 'data: {"type": "finish", "finishReason": "stop"}\n\n'
 
 
-def test_stream_chat_turn_emits_the_route_the_turn_chose():
-    async def run_turn(on_stage, on_answer_ready, on_route):
-        await on_stage("routing")
-        await on_route("direct")
-        return GroundedAnswer(answer="Hello.")
+def test_route_is_streamed_as_a_data_part():
+    parts = collect(
+        scripted(
+            StageEvent("routing"),
+            RouteEvent("direct"),
+            AnswerEvent(GroundedAnswer(answer="Hello.")),
+        )
+    )
 
-    parts = collect_turn(run_turn)
-    routes = [
-        json.loads(part.removeprefix("data: ").strip())["data"]["route"]
-        for part in parts
-        if '"data-route"' in part
-    ]
-
+    routes = [p["data"]["route"] for p in payloads(parts) if p["type"] == "data-route"]
     assert routes == ["direct"]
-    route_index = next(index for index, part in enumerate(parts) if '"data-route"' in part)
-    first_delta = min(index for index, part in enumerate(parts) if '"text-delta"' in part)
-    assert route_index < first_delta
 
 
 def test_disconnected_turn_keeps_running_after_the_stream_closes():
@@ -80,73 +79,50 @@ def test_disconnected_turn_keeps_running_after_the_stream_closes():
     async def verify():
         finished = asyncio.Event()
 
-        async def run_turn(on_stage, on_answer_ready, on_route):
+        async def events():
             await asyncio.sleep(0)
             finished.set()
-            return GroundedAnswer(answer="Persisted anyway.")
+            yield AnswerEvent(GroundedAnswer(answer="Persisted anyway."))
 
-        stream = stream_chat_turn(run_turn)
+        stream = stream_chat_turn(events())
         await anext(stream)
         await stream.aclose()
-        await asyncio.wait_for(finished.wait(), timeout=0.1)
+        await asyncio.wait_for(finished.wait(), timeout=0.5)
 
     asyncio.run(verify())
 
 
-def test_stream_chat_turn_accepts_short_non_rag_stage_sequence():
-    async def run_turn(on_stage, on_answer_ready, on_route):
-        await on_stage("routing")
-        await on_stage("saving")
-        return GroundedAnswer(answer="Hello.")
-
-    parts = collect_turn(run_turn)
-
-    assert stages_in(parts) == ["routing", "saving"]
-    assert any('"delta": "Hello."' in part for part in parts)
-
-
-def test_stream_chat_turn_reports_retrieval_failure_without_answer_text():
-    async def run_turn(on_stage, on_answer_ready, on_route):
-        await on_stage("searching")
-        raise RetrievalError("pgvector connection reset at 10.0.0.4:5432")
-
-    parts = collect_turn(run_turn)
+def test_retrieval_failure_is_typed_and_has_no_answer_text():
+    parts = collect(
+        scripted(
+            StageEvent("searching"),
+            error=RetrievalError("pgvector connection reset at 10.0.0.4:5432"),
+        )
+    )
 
     assert stages_in(parts) == ["searching"]
     assert '"code": "retrieval_failed"' in parts[-2]
-    assert parts[-1] == 'data: {"type": "finish", "finishReason": "error"}\n\n'
+    assert parts[-1] == FINISH_ERROR
     assert not any('"text-delta"' in part for part in parts)
 
 
-def test_stream_chat_turn_reports_grounding_failure():
-    async def run_turn(on_stage, on_answer_ready, on_route):
-        await on_stage("searching")
-        await on_stage("analyzing")
-        await on_stage("validating")
-        raise GroundingError("citation 2 does not map to retrieved evidence")
+def test_grounding_failure_is_typed():
+    parts = collect(scripted(StageEvent("validating"), error=GroundingError("bad citation")))
 
-    parts = collect_turn(run_turn)
-
-    assert stages_in(parts) == ["searching", "analyzing", "validating"]
     assert '"code": "grounding_failed"' in parts[-2]
 
 
-def test_stream_chat_turn_never_leaks_exception_text():
+def test_exception_text_never_reaches_the_browser():
     secret = "postgres://analyst:hunter2@db.internal:5432"
 
-    async def run_turn(on_stage, on_answer_ready, on_route):
-        await on_stage("searching")
-        raise RuntimeError(secret)
-
-    parts = collect_turn(run_turn)
-    body = "".join(parts)
+    body = "".join(collect(scripted(StageEvent("searching"), error=RuntimeError(secret))))
 
     assert '"code": "processing_failed"' in body
     assert secret not in body
     assert "RuntimeError" not in body
 
 
-def test_stream_chat_turn_logs_unexpected_failure_with_traceback(monkeypatch):
+def test_unexpected_failure_is_logged_with_its_stage(monkeypatch):
     logged = []
 
     class FakeLogger:
@@ -155,78 +131,70 @@ def test_stream_chat_turn_logs_unexpected_failure_with_traceback(monkeypatch):
 
     monkeypatch.setattr("app.chat.streaming.logger", FakeLogger())
 
-    async def run_turn(on_stage, on_answer_ready, on_route):
-        await on_stage("searching")
-        raise RuntimeError("database unavailable")
+    collect(scripted(StageEvent("searching"), error=RuntimeError("database unavailable")))
 
-    collect_turn(run_turn)
+    assert logged == [("chat_turn_failed", {"error_code": "processing_failed", "stage": "searching"})]
 
-    assert logged == [
-        (
-            "chat_turn_failed",
-            {"error_code": "processing_failed", "stage": "searching"},
-        )
-    ]
+
+def test_turn_that_ends_without_an_answer_fails_closed():
+    parts = collect(scripted(StageEvent("routing")))
+
+    assert '"code": "processing_failed"' in parts[-2]
+    assert parts[-1] == FINISH_ERROR
 
 
 def test_stream_opens_before_slow_turn_work_completes():
     async def verify():
         release = asyncio.Event()
 
-        async def run_turn(on_stage, on_answer_ready, on_route):
+        async def events():
             await release.wait()
-            return GroundedAnswer(answer="Finished.")
+            yield AnswerEvent(GroundedAnswer(answer="Finished."))
 
-        stream = stream_chat_turn(run_turn)
+        stream = stream_chat_turn(events())
         first = await asyncio.wait_for(anext(stream), timeout=0.1)
         release.set()
         await stream.aclose()
         return first
 
-    first = asyncio.run(verify())
-
-    assert first == 'data: {"type": "start", "messageId": "assistant-message"}\n\n'
+    assert asyncio.run(verify()) == 'data: {"type": "start", "messageId": "assistant-message"}\n\n'
 
 
-def test_instant_text_arrives_before_persistence_finishes():
+def test_early_answer_text_arrives_before_later_work_finishes():
     async def verify():
-        release_persistence = asyncio.Event()
-        answer = GroundedAnswer(answer="Hello.")
+        release = asyncio.Event()
 
-        async def run_turn(on_stage, on_answer_ready, on_route):
-            await on_stage("routing")
-            await on_answer_ready(answer)
-            await on_stage("saving")
-            await release_persistence.wait()
-            return answer
+        async def events():
+            yield StageEvent("routing")
+            yield AnswerEvent(GroundedAnswer(answer="Hello."))
+            yield StageEvent("saving")
+            await release.wait()
 
-        stream = stream_chat_turn(run_turn)
+        stream = stream_chat_turn(events())
         observed = []
         while not any('"text-delta"' in part for part in observed):
             observed.append(await asyncio.wait_for(anext(stream), timeout=0.1))
-        assert not release_persistence.is_set()
-
-        release_persistence.set()
+        assert not release.is_set()
+        release.set()
         observed.extend([part async for part in stream])
         return observed
 
     parts = asyncio.run(verify())
 
-    first_delta = next(index for index, part in enumerate(parts) if '"text-delta"' in part)
-    saving = next(index for index, part in enumerate(parts) if '"stage": "saving"' in part)
+    first_delta = next(i for i, part in enumerate(parts) if '"text-delta"' in part)
+    saving = next(i for i, part in enumerate(parts) if '"stage": "saving"' in part)
     assert first_delta < saving
-    assert parts[-1] == 'data: {"type": "finish", "finishReason": "stop"}\n\n'
+    assert parts[-1] == FINISH_STOP
 
 
-def test_persistence_failure_after_early_text_finishes_with_typed_error():
-    answer = GroundedAnswer(answer="Hello.")
-
-    async def run_turn(on_stage, on_answer_ready, on_route):
-        await on_answer_ready(answer)
-        raise RuntimeError("database unavailable")
-
-    parts = collect_turn(run_turn)
+def test_failure_after_early_text_finishes_with_typed_error():
+    parts = collect(
+        scripted(
+            AnswerEvent(GroundedAnswer(answer="Hello.")),
+            error=RuntimeError("database unavailable"),
+        )
+    )
 
     assert any('"text-delta"' in part for part in parts)
     assert '"code": "processing_failed"' in parts[-2]
-    assert parts[-1] == 'data: {"type": "finish", "finishReason": "error"}\n\n'
+    assert parts[-1] == FINISH_ERROR

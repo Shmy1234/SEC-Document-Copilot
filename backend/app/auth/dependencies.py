@@ -1,18 +1,8 @@
-from uuid import UUID
+from fastapi import Header, HTTPException, Request, status
 
-import httpx
-from fastapi import Header, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
+from app.auth.verifier import AuthenticatedUser, InvalidTokenError, SupabaseTokenVerifier
 
-from app.config import settings
-
-
-class AuthenticatedUser(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    id: UUID
-    email: str | None = None
-    user_metadata: dict[str, object] = Field(default_factory=dict)
+__all__ = ["AuthenticatedUser", "get_current_user", "get_token_verifier"]
 
 
 def _unauthorized() -> HTTPException:
@@ -33,23 +23,18 @@ def _bearer_token(authorization: str | None) -> str:
     return token.strip()
 
 
+def get_token_verifier(request: Request) -> SupabaseTokenVerifier:
+    return request.app.state.resources.token_verifier
+
+
 async def get_current_user(
+    request: Request,
     authorization: str | None = Header(default=None),
 ) -> AuthenticatedUser:
     """Verify a Supabase JWT and return the authenticated user."""
+    # Parse before touching app state so a missing header is rejected cheaply.
     token = _bearer_token(authorization)
-    headers = {
-        "apikey": settings.SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {token}",
-    }
-
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        response = await client.get(f"{settings.SUPABASE_URL}/auth/v1/user", headers=headers)
-
-    if response.status_code != status.HTTP_200_OK:
-        raise _unauthorized()
-
     try:
-        return AuthenticatedUser.model_validate(response.json())
-    except (TypeError, ValueError):
+        return await get_token_verifier(request).verify(token)
+    except InvalidTokenError:
         raise _unauthorized() from None

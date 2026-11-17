@@ -5,10 +5,11 @@ from dataclasses import asdict
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import create_engine, delete, select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
+from app.database.engine import create_database_engine, create_session_factory
 from app.database.models.documents import DocumentChunk, DocumentTable, SourceDocument
 from ingest.chunking import ChunkRecord
 from ingest.manifest import IngestDocument
@@ -16,8 +17,7 @@ from ingest.models import ExtractedTable
 
 
 def create_sessionmaker() -> sessionmaker[Session]:
-    engine = create_engine(settings.sqlalchemy_database_url, pool_pre_ping=True)
-    return sessionmaker(bind=engine, expire_on_commit=False)
+    return create_session_factory(create_database_engine(settings.sqlalchemy_database_url))
 
 
 def document_exists(session: Session, accession_number: str) -> bool:
