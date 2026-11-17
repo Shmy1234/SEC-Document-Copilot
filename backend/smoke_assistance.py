@@ -7,11 +7,14 @@ from dataclasses import asdict, dataclass
 from time import perf_counter
 from uuid import uuid4
 
+from openai import AsyncOpenAI
+
 from app.assistant.agent import agent_usage_limits, document_agent
 from app.assistant.deps import DocumentAgentDeps
 from app.chat.orchestrator import AgentRunner
 from app.config import settings
 from app.grounding.validator import GroundingValidator
+from app.retrieval.embeddings import OpenAIQueryEmbedder
 from app.retrieval.retriever import DocumentRetriever
 from app.retrieval.schemas import RetrievalFilters
 from ingest.repository import create_sessionmaker
@@ -137,7 +140,10 @@ async def run_query(
     retriever: DocumentRetriever | None = None,
 ) -> SmokeResult:
     runner = agent_runner or document_agent
-    active_retriever = retriever or DocumentRetriever(session_factory=create_sessionmaker())
+    active_retriever = retriever or DocumentRetriever(
+        session_factory=create_sessionmaker(),
+        embedder=OpenAIQueryEmbedder(AsyncOpenAI(api_key=settings.OPENAI_API_KEY)),
+    )
     validator = GroundingValidator()
     started = perf_counter()
     first_stage_seconds: float | None = None

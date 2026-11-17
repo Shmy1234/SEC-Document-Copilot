@@ -1,7 +1,7 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
 from app.assistant.agent import document_agent
@@ -21,20 +21,30 @@ from app.chat.schemas import (
 )
 from app.chat.streaming import stream_chat_turn
 from app.database.chats import ChatStore, ForbiddenThreadError, ThreadNotFoundError
-from app.database.supabase import create_service_role_client
 from app.grounding.validator import GroundingValidator
+from app.resources import Resources
+from app.retrieval.embeddings import OpenAIQueryEmbedder
 from app.retrieval.retriever import DocumentRetriever
-from ingest.repository import create_sessionmaker
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 
-def get_chat_store() -> ChatStore:
-    return ChatStore(create_service_role_client())
+def get_resources(request: Request) -> Resources:
+    return request.app.state.resources
 
 
-def get_document_retriever() -> DocumentRetriever:
-    return DocumentRetriever(session_factory=create_sessionmaker())
+ResourcesDependency = Annotated[Resources, Depends(get_resources)]
+
+
+def get_chat_store(resources: ResourcesDependency) -> ChatStore:
+    return ChatStore(resources.supabase)
+
+
+def get_document_retriever(resources: ResourcesDependency) -> DocumentRetriever:
+    return DocumentRetriever(
+        session_factory=resources.session_factory,
+        embedder=OpenAIQueryEmbedder(resources.openai),
+    )
 
 
 def get_agent_runner():
